@@ -207,13 +207,13 @@ The spike is in `spike/`. It was deployed to Workers Paid as `rejgau-spike` and 
 - **CDN** results are as described under Media.
 - **Observed payloads**
   - Deferred command responses: `MESSAGE_CREATE` with flags `LOADING` (128), then `MESSAGE_UPDATE` with the real content (here `IS_COMPONENTS_V2`, 32768).
-  - Button clicks that edit a response: `MESSAGE_UPDATE` with `edited_timestamp`. The original command's `interaction_metadata` is kept.
+  - When an app edits its own response (e.g. jbotci re-rendering after a button click, which is app-specific behavior), we see `MESSAGE_UPDATE` with `edited_timestamp`, and the original command's `interaction_metadata` is kept. The click itself is invisible.
   - Components V2 arrive as the full tree, including media gallery items that point at `cdn.discordapp.com` attachments.
   - Link embeds arrive as a follow-up `MESSAGE_UPDATE` with no `edited_timestamp` (unfurl).
   - Forwards (`flags` 16384) carry full `message_snapshots` content, including forwards from other channels.
   - Polls, poll votes, reactions, edits and deletes all arrive as expected.
   - User objects carry many cosmetic fields (`collectibles`, `primary_guild`, `avatar_decoration_data`, …). They are kept verbatim in raw, and the reader ignores what it doesn't render.
-- **Not yet verified:** responses from an app installed *only* as a user app. The test app is installed both on the guild and for the user.
+- **User-installed apps work.** A command from an app installed only for the user (not in the server) produced a normal `MESSAGE_CREATE` (LOADING) and `MESSAGE_UPDATE`. They carry `interaction_metadata.name` and `authorizing_integration_owners: {"1": <user id>}`, with no `"0"` (guild) key, which distinguishes them from guild-installed apps.
 
 Later:
 - Backfill of existing history when a channel is enabled: on by default, paced.
