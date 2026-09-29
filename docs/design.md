@@ -2,7 +2,7 @@
 
 rejgau archives the public channels of a Discord server into a git repository. It also ships a static, Discord-like reader with search.
 
-Status: design agreed, with a feasibility spike pending (see [Open questions](#open-questions)). Research date: 2026-09-29.
+Status: design agreed; feasibility spike done (see [Spike results](#spike-results-2026-09-29)). Research date: 2026-09-29.
 
 ## Goals and non-goals
 
@@ -72,7 +72,7 @@ GitHub: <server>-archive (public)
   - Guild: updates to guild, roles, emoji and stickers (needed for rendering).
   - Text chat in voice and stage channels, and forwards (`message_snapshots`).
 - **Other apps' commands**
-  - What's visible: the public response message (type 20/23) with `interaction_metadata` (invoking user, target, follow-up linkage), and the command name via the deprecated `interaction.name` (to be verified).
+  - What's visible: the public response message (type 20/23) with `interaction_metadata` (invoking user, target, follow-up linkage), and the command name. The spike confirmed the name is present both in the deprecated `interaction.name` and, undocumented, in `interaction_metadata.name` (with `command_type`), including the subcommand path (e.g. `jbotci gentufa`).
   - Deferred responses appear as a LOADING message followed by `MESSAGE_UPDATE`.
   - Not visible: the invocation itself, command arguments, ephemeral responses, and button/select/modal submissions (only their visible effects).
   - Components V2 layouts arrive as the full component tree.
@@ -131,10 +131,13 @@ Everything below lives under a configurable folder on the `archive` branch. All 
 - **Index:** `media.json` maps each source (attachment ID, `emoji:<id>`, `avatar:<user>/<hash>`, …) to `{ sha256, size, type, release, asset }`.
 - **Fetcher**
   - Attachment URLs are signed and expire (the lifetime is undocumented; historically 24 h), so media is fetched at ingest.
-  - Discord's docs say Workers get 403 from `cdn.discordapp.com/attachments`; the spike will confirm or refute this.
-    - If Workers *can* fetch: the `GuildArchive` Durable Object downloads the file and uploads it to the release directly (`uploads.github.com`).
-    - Otherwise: the Durable Object sends `repository_dispatch` listing the pending sources. A reusable workflow in rejgau downloads them, using the bot token as an Actions secret to refresh expired URLs via `GET /channels/{c}/messages/{m}`, and uploads them as release assets. The Durable Object then records the results in `media.json`. It polls the release assets, or receives an HMAC-signed callback on its workers.dev endpoint.
-  - Either way, only the bot writes the `archive` branch.
+  - The spike showed that Workers **can** fetch from `cdn.discordapp.com`: real signed attachments, avatars, custom emoji, and PNG/APNG/Lottie stickers (`cdn.discordapp.com/stickers/{id}.png|json`). Discord's docs claiming a 403 are outdated.
+  - Discord's proxy hosts are blocked (Cloudflare 403): `media.discordapp.net` and `images-ext-*.discordapp.net`. We avoid them:
+    - attachments: use `url` rather than `proxy_url`;
+    - embed images and thumbnails: fetch the embed's original `url` (e.g. `i.ytimg.com`, `repository-images.githubusercontent.com`) directly;
+    - GIF stickers (`format_type` 4) exist only on `media.discordapp.net`. They are recorded as "unfetched", with a GitHub Action fallback later if they turn out to matter.
+  - So the `GuildArchive` Durable Object downloads each file and uploads it to the release itself (`uploads.github.com`). No Action is needed.
+  - Only the bot writes the `archive` branch.
 
 ## Writing to GitHub
 
@@ -195,14 +198,22 @@ The admin may rewrite `archive` history at any time, for example to remove messa
   - `from:` and `mentions:` resolve names through `users.json`. `in:` resolves through `channels.json`.
   - v1 scans view files in a Web Worker, newest first, with date and channel filters pruning which files are fetched. At the expected volume the whole archive fits comfortably. A prebuilt index (MiniSearch shards, Pagefind or SQLite FTS built in CI) can come later if needed.
 
-## Open questions
+## Spike results (2026-09-29)
 
-The spike is in `spike/` and is to be run from real Cloudflare egress:
+The spike is in `spike/`. It was deployed to Workers Paid as `rejgau-spike` and connected to the test server.
 
-1. Does the Gateway accept WebSocket connections from Workers? It returned 401 in 2023; community reports say it has worked since late 2025.
-2. Does `cdn.discordapp.com` (or `media.discordapp.net`) return 403 to Workers for attachments, avatars, emoji and stickers? This decides between the Worker-direct and Actions media fetchers.
-3. Is the deprecated `interaction.name` still populated on command responses? Do public responses from user-installed apps reach other bots?
-4. How often do long-lived Durable Objects actually restart?
+- **Gateway from a Durable Object works.** HELLO arrives about 50 ms after the upgrade, and IDENTIFY/READY and heartbeats work.
+- **Restarts and resume.** Over the first ~3.5 h the Durable Object restarted 4 times, with no deploys. Each time the alarm reconnected and RESUMEd successfully, with 0 re-identifies and 0 zombie connections. Restarts are routine, so resume must be solid, and the gap-detection path is still required for when resume fails.
+- **CDN** results are as described under Media.
+- **Observed payloads**
+  - Deferred command responses: `MESSAGE_CREATE` with flags `LOADING` (128), then `MESSAGE_UPDATE` with the real content (here `IS_COMPONENTS_V2`, 32768).
+  - Button clicks that edit a response: `MESSAGE_UPDATE` with `edited_timestamp`. The original command's `interaction_metadata` is kept.
+  - Components V2 arrive as the full tree, including media gallery items that point at `cdn.discordapp.com` attachments.
+  - Link embeds arrive as a follow-up `MESSAGE_UPDATE` with no `edited_timestamp` (unfurl).
+  - Forwards (`flags` 16384) carry full `message_snapshots` content, including forwards from other channels.
+  - Polls, poll votes, reactions, edits and deletes all arrive as expected.
+  - User objects carry many cosmetic fields (`collectibles`, `primary_guild`, `avatar_decoration_data`, …). They are kept verbatim in raw, and the reader ignores what it doesn't render.
+- **Not yet verified:** responses from an app installed *only* as a user app. The test app is installed both on the guild and for the user.
 
 Later:
 - Backfill of existing history when a channel is enabled: on by default, paced.
