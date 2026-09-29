@@ -28,6 +28,10 @@ const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const GUILD_ID_IN_ID = new Set(["GUILD_CREATE", "GUILD_UPDATE", "GUILD_DELETE"]);
 
 const PUMP_BATCH = 100;
+/** After this many consecutive failures, the outbox head is set aside so other events can flow. */
+const PUMP_MAX_FAILURES = 10;
+/** Discord resets the token after 1000 IDENTIFYs a day; stay far below that even in a crash loop. */
+const IDENTIFY_BUDGET_PER_DAY = 50;
 
 export class GatewaySession extends DurableObject<Env> {
   private ws: WebSocket | null = null;
@@ -35,6 +39,7 @@ export class GatewaySession extends DurableObject<Env> {
   private awaitingAck = false;
   private pumping = false;
   private pumpRetry: ReturnType<typeof setTimeout> | null = null;
+  private pumpFailures = { n: -1, count: 0 };
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -42,6 +47,7 @@ export class GatewaySession extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS outbox (n INTEGER PRIMARY KEY AUTOINCREMENT, guild TEXT NOT NULL, sid TEXT NOT NULL, s INTEGER NOT NULL, t TEXT NOT NULL, d TEXT NOT NULL, at INTEGER NOT NULL)`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS dead (n INTEGER PRIMARY KEY, guild TEXT NOT NULL, sid TEXT NOT NULL, s INTEGER NOT NULL, t TEXT NOT NULL, d TEXT NOT NULL, at INTEGER NOT NULL, error TEXT)`);
       this.bump("boots");
       if (this.get("running") === "1" && (await ctx.storage.getAlarm()) === null) {
         await ctx.storage.setAlarm(Date.now() + 1000);
@@ -100,7 +106,8 @@ export class GatewaySession extends DurableObject<Env> {
     delete kv.sessionId;
     delete kv.resumeUrl;
     const outbox = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM outbox`).one().n;
-    return { connected: this.ws !== null, outbox, ...kv };
+    const deadLetters = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM dead`).one().n;
+    return { connected: this.ws !== null, outbox, deadLetters, ...kv };
   }
 
   // --- connection ---
@@ -113,6 +120,17 @@ export class GatewaySession extends DurableObject<Env> {
     }
     this.set("configError", null);
     const resume = this.get("sessionId") !== null;
+    if (!resume) {
+      const recent = (JSON.parse(this.get("identifyTimes") ?? "[]") as number[]).filter((t) => t > Date.now() - 86_400_000);
+      if (recent.length >= IDENTIFY_BUDGET_PER_DAY) {
+        this.set("identifyThrottled", new Date().toISOString());
+        log("identify_budget_exhausted", { recent: recent.length });
+        await this.ctx.storage.setAlarm(Date.now() + 3_600_000);
+        return;
+      }
+      this.set("identifyThrottled", null);
+      this.set("identifyTimes", JSON.stringify([...recent, Date.now()]));
+    }
     const base = (resume && this.get("resumeUrl")) || GATEWAY_URL;
     let resp: Response;
     try {
@@ -164,7 +182,7 @@ export class GatewaySession extends DurableObject<Env> {
           this.bump("identifies");
           this.send(ws, { op: 2, d: { token, intents: INTENTS, properties: { os: "linux", browser: "rejgau", device: "rejgau" } } });
         }
-        this.ctx.storage.setAlarm(Date.now() + Math.floor(interval * Math.random()));
+        this.ctx.waitUntil(this.ctx.storage.setAlarm(Date.now() + Math.floor(interval * Math.random())));
         return;
       }
       case 11:
@@ -186,7 +204,7 @@ export class GatewaySession extends DurableObject<Env> {
         this.drop(ws, "invalid session");
         return;
       case 0:
-        this.onDispatch(msg.t!, msg.s!, msg.d);
+        this.onDispatch(msg.t!, msg.s ?? -1, msg.d);
         return;
     }
   }
@@ -195,6 +213,7 @@ export class GatewaySession extends DurableObject<Env> {
   private onDispatch(t: string, s: number, d: any): void {
     const cfg = this.config();
     const at = Date.now();
+    if (t === "READY" || t === "RESUMED") this.set("connectFailures", null);
     if (t === "READY") {
       this.set("sessionId", d.session_id);
       this.set("resumeUrl", d.resume_gateway_url);
@@ -246,16 +265,27 @@ export class GatewaySession extends DurableObject<Env> {
         try {
           await this.env.GUILD.get(this.env.GUILD.idFromName(head.guild)).ingest(head.guild, events);
         } catch (e) {
-          this.set("lastPumpError", errorMessage(e));
-          log("pump_error", { error: errorMessage(e) });
+          const error = errorMessage(e);
+          this.set("lastPumpError", error);
+          log("pump_error", { error });
+          const first = run[0].n;
+          this.pumpFailures = this.pumpFailures.n === first ? { n: first, count: this.pumpFailures.count + 1 } : { n: first, count: 1 };
+          if (this.pumpFailures.count >= PUMP_MAX_FAILURES) {
+            // Set the head event aside (visible in /status) so one bad event can't stall everything.
+            this.sql.exec(`INSERT OR REPLACE INTO dead SELECT *, ? FROM outbox WHERE n = ?`, error.slice(0, 500), first);
+            this.sql.exec(`DELETE FROM outbox WHERE n = ?`, first);
+            log("pump_dead_letter", { n: first });
+            continue;
+          }
           if (!this.pumpRetry) {
             this.pumpRetry = setTimeout(() => {
               this.pumpRetry = null;
               this.kickPump();
-            }, 5000);
+            }, Math.min(300_000, 5000 * 2 ** (this.pumpFailures.count - 1)));
           }
           return;
         }
+        this.pumpFailures = { n: -1, count: 0 };
         this.sql.exec(`DELETE FROM outbox WHERE n <= ? AND guild = ?`, run[run.length - 1].n, head.guild);
       }
     } finally {
@@ -288,9 +318,13 @@ export class GatewaySession extends DurableObject<Env> {
     this.ctx.waitUntil(this.scheduleReconnect());
   }
 
+  /** Reconnects with exponential backoff (1 s … 5 min, jittered); reset by READY/RESUMED. */
   private async scheduleReconnect(): Promise<void> {
     if (this.get("running") !== "1") return;
-    await this.ctx.storage.setAlarm(Date.now() + 1000 + Math.floor(Math.random() * 4000));
+    const failures = Number(this.get("connectFailures") ?? "0");
+    this.set("connectFailures", String(failures + 1));
+    const delay = Math.min(300_000, 1000 * 2 ** failures);
+    await this.ctx.storage.setAlarm(Date.now() + delay + Math.floor(Math.random() * Math.min(delay, 4000)));
   }
 
   async alarm(): Promise<void> {

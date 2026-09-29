@@ -10,9 +10,25 @@ export class GitHubError extends Error {
     readonly status: number,
     readonly body: string,
     what: string,
+    /** Set when GitHub says to back off (primary or secondary rate limit): wait this long. */
+    readonly retryAfterMs: number | null = null,
   ) {
     super(`GitHub ${what} failed: ${status} ${body.slice(0, 300)}`);
   }
+}
+
+/** Builds a GitHubError from a failed response, recognizing rate-limit responses. */
+async function failure(res: Response, what: string): Promise<GitHubError> {
+  const body = await res.text();
+  let retryAfterMs: number | null = null;
+  if (res.status === 403 || res.status === 429) {
+    const retryAfter = res.headers.get("retry-after");
+    const reset = res.headers.get("x-ratelimit-reset");
+    if (retryAfter) retryAfterMs = Number(retryAfter) * 1000;
+    else if (res.headers.get("x-ratelimit-remaining") === "0" && reset) retryAfterMs = Math.max(0, Number(reset) * 1000 - Date.now());
+    else if (/rate limit/i.test(body)) retryAfterMs = 60_000; // secondary limit without headers: GitHub asks for at least a minute
+  }
+  return new GitHubError(res.status, body, what, retryAfterMs);
 }
 
 /** The branch moved (or appeared) between reading it and updating it. */
@@ -128,7 +144,7 @@ export class GitHub {
     if (cached && cached.expiresAt - Date.now() > 5 * 60_000) return cached.token;
     const jwt = await appJwt(this.appId, this.privateKey);
     const inst = await this.raw("GET", `/repos/${this.repo}/installation`, undefined, `Bearer ${jwt}`);
-    if (!inst.ok) throw new GitHubError(inst.status, await inst.text(), "installation lookup (is the App installed on the repo?)");
+    if (!inst.ok) throw await failure(inst, "installation lookup (is the App installed on the repo?)");
     const { id } = (await inst.json()) as { id: number };
     const res = await this.raw(
       "POST",
@@ -136,7 +152,7 @@ export class GitHub {
       { repositories: [this.name], permissions: { contents: "write", metadata: "read" } },
       `Bearer ${jwt}`,
     );
-    if (!res.ok) throw new GitHubError(res.status, await res.text(), "installation token");
+    if (!res.ok) throw await failure(res, "installation token");
     const t = (await res.json()) as { token: string; expires_at: string };
     tokenCache.set(this.repo, { token: t.token, expiresAt: Date.parse(t.expires_at) });
     return t.token;
@@ -167,7 +183,7 @@ export class GitHub {
 
   private async json<T>(method: string, path: string, body: unknown, what: string): Promise<T> {
     const res = await this.raw(method, path, body);
-    if (!res.ok) throw new GitHubError(res.status, await res.text(), what);
+    if (!res.ok) throw await failure(res, what);
     return (await res.json()) as T;
   }
 
@@ -182,7 +198,7 @@ export class GitHub {
       await res.body?.cancel();
       return null;
     }
-    if (!res.ok) throw new GitHubError(res.status, await res.text(), `read branch ${branch}`);
+    if (!res.ok) throw await failure(res, `read branch ${branch}`);
     return ((await res.json()) as { object: { sha: string } }).object.sha;
   }
 
@@ -194,7 +210,7 @@ export class GitHub {
       await res.body?.cancel();
       return null;
     }
-    if (!res.ok) throw new GitHubError(res.status, await res.text(), `read ${path}`);
+    if (!res.ok) throw await failure(res, `read ${path}`);
     return await res.text();
   }
 
@@ -228,7 +244,7 @@ export class GitHub {
       ? await this.raw("PATCH", this.repoPath(`/git/refs/heads/${encodeURIComponent(branch)}`), { sha: commit.sha, force: false })
       : await this.raw("POST", this.repoPath("/git/refs"), { ref: `refs/heads/${branch}`, sha: commit.sha });
     if (res.status === 422 || res.status === 409) throw new ConflictError(`branch ${branch} moved: ${await res.text()}`);
-    if (!res.ok) throw new GitHubError(res.status, await res.text(), "update branch");
+    if (!res.ok) throw await failure(res, "update branch");
     await res.body?.cancel();
     return commit.sha;
   }
@@ -247,7 +263,7 @@ export class GitHub {
         content: btoa("# Discord archive\n\nWritten by [rejgau](https://github.com/int19h/rejgau). Logs are on the `archive` branch.\n"),
       }, "seed empty repo");
     } else if (!res.ok) {
-      throw new GitHubError(res.status, await res.text(), "check repo");
+      throw await failure(res, "check repo");
     } else {
       await res.body?.cancel();
     }
@@ -255,9 +271,11 @@ export class GitHub {
   }
 
   /** SHA of the parentless commit that media release tags point at; created on first use. */
-  async mediaRoot(): Promise<string> {
+  async mediaRoot(retried = false): Promise<string> {
     const res = await this.raw("GET", this.repoPath("/git/ref/tags/media-root"));
     if (res.ok) return ((await res.json()) as { object: { sha: string } }).object.sha;
+    // 409 = empty repository; anything but that or 404 is a real error.
+    if (res.status !== 404 && res.status !== 409) throw await failure(res, "read media-root tag");
     await res.body?.cancel();
     await this.ensureNotEmpty();
     const tree = await this.json<{ sha: string }>(
@@ -279,11 +297,11 @@ export class GitHub {
     );
     const commit = await this.json<{ sha: string }>("POST", this.repoPath("/git/commits"), { message: "Media root", tree: tree.sha, parents: [] }, "create media-root commit");
     const ref = await this.raw("POST", this.repoPath("/git/refs"), { ref: "refs/tags/media-root", sha: commit.sha });
-    if (ref.status === 422) {
+    if (ref.status === 422 && !retried) {
       await ref.body?.cancel();
-      return this.mediaRoot(); // created concurrently
+      return this.mediaRoot(true); // created concurrently
     }
-    if (!ref.ok) throw new GitHubError(ref.status, await ref.text(), "create media-root tag");
+    if (!ref.ok) throw await failure(ref, "create media-root tag");
     await ref.body?.cancel();
     return commit.sha;
   }
@@ -291,7 +309,7 @@ export class GitHub {
   /** Creates a lightweight tag; a no-op if it already exists. */
   async ensureTag(tag: string, sha: string): Promise<void> {
     const res = await this.raw("POST", this.repoPath("/git/refs"), { ref: `refs/tags/${tag}`, sha });
-    if (!res.ok && res.status !== 422) throw new GitHubError(res.status, await res.text(), `create tag ${tag}`);
+    if (!res.ok && res.status !== 422) throw await failure(res, `create tag ${tag}`);
     await res.body?.cancel();
   }
 
@@ -301,7 +319,7 @@ export class GitHub {
       await res.body?.cancel();
       return null;
     }
-    if (!res.ok) throw new GitHubError(res.status, await res.text(), `read release ${tag}`);
+    if (!res.ok) throw await failure(res, `read release ${tag}`);
     return (await res.json()) as Release;
   }
 
@@ -325,7 +343,7 @@ export class GitHub {
 
   async deleteAsset(assetId: number): Promise<void> {
     const res = await this.raw("DELETE", this.repoPath(`/releases/assets/${assetId}`));
-    if (!res.ok && res.status !== 404) throw new GitHubError(res.status, await res.text(), "delete asset");
+    if (!res.ok && res.status !== 404) throw await failure(res, "delete asset");
     await res.body?.cancel();
   }
 
@@ -354,7 +372,7 @@ export class GitHub {
       if (text.includes("already_exists")) return null;
       throw new GitHubError(422, text, `upload ${name}`);
     }
-    if (!res.ok) throw new GitHubError(res.status, await res.text(), `upload ${name}`);
+    if (!res.ok) throw await failure(res, `upload ${name}`);
     return (await res.json()) as Asset;
   }
 }

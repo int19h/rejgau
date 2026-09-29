@@ -19,8 +19,9 @@ const CDN = "https://cdn.discordapp.com";
 
 /** Characters GitHub keeps in asset names; everything else becomes "_". */
 export function sanitizeName(name: string, max = 100): string {
-  const clean = name.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^[._]+/, "");
-  return (clean || "file").slice(-max);
+  // GitHub also rewrites leading and trailing dots, so avoid them to keep names predictable.
+  const clean = name.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^[._]+/, "").replace(/\.+$/, "");
+  return (clean || "file").slice(-max).replace(/^\.+/, "");
 }
 
 function extOf(pathname: string): string {

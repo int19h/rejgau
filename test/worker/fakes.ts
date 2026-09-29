@@ -24,6 +24,8 @@ export class FakeRepo {
   blobs = new Map<string, string>();
   releases: { id: number; tag_name: string; assets: { id: number; name: string; size: number; content_type: string; state: string }[] }[] = [];
   requests: string[] = [];
+  /** Number of upcoming uploads to reject with a secondary rate limit. */
+  rateLimitUploads = 0;
   /** Called before a ref update; lets a test move the branch underneath the bot. */
   beforeRefUpdate: (() => void) | null = null;
 
@@ -58,6 +60,10 @@ export class FakeRepo {
       const m = /\/releases\/(\d+)\/assets$/.exec(path)!;
       const rel = this.releases.find((r) => r.id === Number(m[1]))!;
       const name = url.searchParams.get("name")!;
+      if (this.rateLimitUploads > 0) {
+        this.rateLimitUploads--;
+        return json({ message: "You have exceeded a secondary rate limit." }, 403);
+      }
       if (rel.assets.some((a) => a.name === name)) return json({ errors: [{ code: "already_exists" }] }, 422);
       const asset = { id: newAssetId(), name, size: (body as ArrayBuffer).byteLength, content_type: req.headers.get("content-type")!, state: "uploaded" };
       rel.assets.push(asset);
@@ -75,7 +81,10 @@ export class FakeRepo {
     if ((m = /^\/repos\/o\/r\/contents\/(.+)$/.exec(path))) {
       const commit = this.commits.get(url.searchParams.get("ref")!);
       const content = commit && this.trees.get(commit.tree)!.get(decodeURIComponent(m[1]));
-      return content === undefined ? json({ message: "Not Found" }, 404) : new Response(content);
+      if (content === undefined) return json({ message: "Not Found" }, 404);
+      // Like GitHub: raw content only with the raw media type; otherwise a JSON envelope.
+      if (req.headers.get("accept") !== "application/vnd.github.raw+json") return json({ type: "file", encoding: "base64", content: btoa(content) });
+      return new Response(content);
     }
     if ((m = /^\/repos\/o\/r\/git\/ref\/(.+)$/.exec(path))) {
       if (this.empty) return json({ message: "Git Repository is empty." }, 409);
@@ -134,7 +143,8 @@ export class FakeRepo {
     if ((m = /^\/repos\/o\/r\/releases\/(\d+)\/assets$/.exec(path))) {
       const rel = this.releases.find((r) => r.id === Number(m![1]))!;
       const page = Number(url.searchParams.get("page") ?? "1");
-      return json(page === 1 ? rel.assets : []);
+      const perPage = Number(url.searchParams.get("per_page") ?? "30");
+      return json(rel.assets.slice((page - 1) * perPage, page * perPage));
     }
     return json({ message: `fake GitHub: unhandled ${req.method} ${path}` }, 500);
   }
@@ -166,13 +176,24 @@ export class FakeDiscord {
   /** channel ID → messages (any order). */
   messages = new Map<string, Record<string, any>[]>();
   channels = new Map<string, Record<string, any>>();
+  /** guild ID → GUILD_CREATE-shaped object, served by the /guilds REST endpoints. */
+  guilds = new Map<string, Record<string, any>>();
   requests: string[] = [];
 
   handle(req: Request): Response {
     const url = new URL(req.url);
     this.requests.push(`${url.pathname}${url.search}`);
     if (url.hostname === "cdn.discordapp.com") {
-      return new Response(new Uint8Array(10), { headers: { "content-type": "image/png", "content-length": "10" } });
+      const bytes = new Uint8Array(10);
+      if (url.pathname.includes("nolength")) {
+        // Streamed without a Content-Length.
+        return new Response(new ReadableStream({ start: (c) => (c.enqueue(bytes), c.close()) }), { headers: { "content-type": "image/png" } });
+      }
+      if (url.pathname.includes("gzipped")) {
+        // Content-Length counts encoded bytes; the body we see is decoded (longer).
+        return new Response(bytes, { headers: { "content-type": "image/png", "content-encoding": "gzip", "content-length": "3" } });
+      }
+      return new Response(bytes, { headers: { "content-type": "image/png", "content-length": "10" } });
     }
     let m: RegExpExecArray | null;
     if ((m = /^\/api\/v10\/channels\/(\d+)\/messages$/.exec(url.pathname))) {
@@ -181,6 +202,13 @@ export class FakeDiscord {
       const newer = (this.messages.get(m[1]) ?? []).filter((msg) => BigInt(msg.id) > after).sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
       // Discord returns the `limit` messages right after `after`, newest first.
       return json(newer.slice(0, limit).reverse());
+    }
+    if ((m = /^\/api\/v10\/guilds\/(\d+)(\/channels|\/threads\/active)?$/.exec(url.pathname))) {
+      const g = this.guilds.get(m[1]);
+      if (!g) return json({ message: "Unknown Guild" }, 404);
+      if (m[2] === "/channels") return json(g.channels);
+      if (m[2] === "/threads/active") return json({ threads: g.threads ?? [], members: [] });
+      return json({ ...g, channels: undefined, threads: undefined });
     }
     if ((m = /^\/api\/v10\/channels\/(\d+)$/.exec(url.pathname))) {
       const ch = this.channels.get(m[1]);

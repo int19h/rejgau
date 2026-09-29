@@ -35,6 +35,10 @@ export function isArchived(id: string, channels: ReadonlyMap<string, ChannelInfo
   const ch = channels.get(id);
   if (!ch || ch.type === CHANNEL_TYPE_CATEGORY) return false;
   const chain = ancestry(id, channels);
+  // Fail closed: if part of the parent chain is unknown, an `exclude` or category selection can't
+  // be evaluated, so nothing is archived until the chain is known.
+  const top = channels.get(chain[chain.length - 1]);
+  if (!top || (top.parentId && !channels.has(top.parentId))) return false;
   for (const c of chain) {
     if ((channels.get(c)?.flags ?? 0) & CHANNEL_FLAG_OBFUSCATED) return false;
   }

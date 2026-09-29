@@ -14,7 +14,8 @@ function json(data: unknown, status = 200): Response {
 /** Constant-time comparison of the presented admin key. */
 async function authorized(request: Request, env: Env): Promise<boolean> {
   if (!env.ADMIN_KEY) return false;
-  const presented = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? new URL(request.url).searchParams.get("key") ?? "";
+  // Header only: a key in the URL could end up in request logs.
+  const presented = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
   const enc = new TextEncoder();
   const [a, b] = await Promise.all([crypto.subtle.digest("SHA-256", enc.encode(presented)), crypto.subtle.digest("SHA-256", enc.encode(env.ADMIN_KEY))]);
   return crypto.subtle.timingSafeEqual(a, b);

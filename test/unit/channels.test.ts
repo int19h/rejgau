@@ -47,3 +47,12 @@ describe("publishedChannelIds", () => {
     expect([...publishedChannelIds(channels, cfg(["13"]))]).toEqual(["13"]);
   });
 });
+
+describe("isArchived with an incomplete channel tree", () => {
+  it("fails closed when a parent is unknown", () => {
+    // Channel 21's category (20) is excluded, but we only know the channel itself.
+    const partial = new Map<string, ChannelInfo>([ch("21", 0, "20"), ch("12", 11, "11")]);
+    expect(isArchived("21", partial, cfg("all", ["20"]))).toBe(false);
+    expect(isArchived("12", partial, cfg("all"))).toBe(false);
+  });
+});

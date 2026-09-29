@@ -8,6 +8,7 @@ describe("parseConfig", () => {
     expect(cfg.flushIdleMs).toBe(120_000);
     expect(cfg.flushMaxMs).toBe(600_000);
     expect(cfg.maxMediaBytes).toBe(100 * 1024 * 1024);
+    expect(cfg.mediaSpacingMs).toBe(8000);
   });
 
   it("normalizes the folder path", () => {

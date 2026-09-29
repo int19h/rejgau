@@ -23,6 +23,8 @@ export interface Config {
   /** Flush at the latest this long after the first pending event. */
   flushMaxMs: number;
   maxMediaBytes: number;
+  /** Minimum time between release uploads (GitHub's content-creation limits). */
+  mediaSpacingMs: number;
 }
 
 const SNOWFLAKE = /^\d{1,20}$/;
@@ -67,7 +69,7 @@ export function parseConfig(raw: string | undefined): Config {
   }
   const num = (v: unknown, dflt: number, name: string) => {
     if (v === undefined) return dflt;
-    if (typeof v !== "number" || !(v > 0)) throw new ConfigError(`${name} must be a positive number`);
+    if (typeof v !== "number" || !(v >= 0)) throw new ConfigError(`${name} must be a non-negative number`);
     return v;
   };
   return {
@@ -75,5 +77,6 @@ export function parseConfig(raw: string | undefined): Config {
     flushIdleMs: num(json.flushIdleSeconds, 120, "flushIdleSeconds") * 1000,
     flushMaxMs: num(json.flushMaxSeconds, 600, "flushMaxSeconds") * 1000,
     maxMediaBytes: num(json.maxMediaMegabytes, 100, "maxMediaMegabytes") * 1024 * 1024,
+    mediaSpacingMs: num(json.mediaUploadSpacingSeconds, 8, "mediaUploadSpacingSeconds") * 1000,
   };
 }

@@ -113,7 +113,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://rejgau.<your-subdomai
   },
   "flushIdleSeconds": 120,
   "flushMaxSeconds": 600,
-  "maxMediaMegabytes": 100
+  "maxMediaMegabytes": 100,
+  "mediaUploadSpacingSeconds": 8
 }
 ```
 
@@ -124,6 +125,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://rejgau.<your-subdomai
 - **`branch`**: defaults to `archive`. It's created if missing.
 - **`flushIdleSeconds` / `flushMaxSeconds`**: commit after this long without new events, or at most this long after the first uncommitted one.
 - **`maxMediaMegabytes`**: larger files are recorded as `MEDIA_FAILED` with `too_large`.
+- **`mediaUploadSpacingSeconds`**: the minimum gap between release uploads, which keeps them under GitHub's limits for content creation.
 
 Changing a variable redeploys the Worker. The Gateway session simply resumes, and selection changes are recorded in the log. Guilds the bot is in but that aren't configured are ignored.
 
@@ -133,7 +135,7 @@ Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized reques
 
 | Endpoint | Effect |
 |---|---|
-| `GET /status` | Gateway state, plus per-guild buffered lines, media queue, last commit and last error. |
+| `GET /status` | Gateway state (including `deadLetters`: events that failed 10 times and were set aside), plus per-guild buffered lines, media queue, last commit, last error and any GitHub rate-limit backoff. |
 | `POST /start`, `POST /stop` | Start the Gateway session (also clears a fatal error, e.g. after fixing the token), or stop it. |
 | `POST /flush[?guild=ID]` | Commit everything buffered now. |
 | `POST /pause[?guild=ID]`, `POST /resume[?guild=ID]` | Stop or restart committing. Events keep being buffered meanwhile. |
@@ -141,7 +143,7 @@ Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized reques
 ## Removing messages from the archive
 
 Deletion is manual, by the archive admin:
-1. `POST /pause`, then `POST /flush` (or the other way round), so nothing is in flight.
+1. `POST /pause`, then `POST /flush`, in that order, so nothing is in flight and nothing new gets committed.
 2. Rewrite the `archive` branch however you like (e.g. `git filter-repo`), and force-push.
 3. Delete the matching release assets.
 4. `POST /resume`.
