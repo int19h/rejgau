@@ -61,14 +61,23 @@ export interface ArchiveState {
   messages: Map<string, MessageState>;
   /** user id → latest member snapshot from MEMBER_SNAPSHOT (null = left the server). */
   memberSnapshots: Map<string, any | null>;
+  /** People seen only as reactors: user id → { user, member, at } from MESSAGE_REACTION_ADD. */
+  reactors: Map<string, { user: any; member: any; at: string }>;
   media: Map<string, MediaEntry>;
 }
 
 const reactionKey = (e: any, burst: boolean) => `${burst ? "b" : "n"}:${e?.id ? `c:${e.id}` : `u:${e?.name ?? ""}`}`;
 
-/** Aligns a tally with a snapshot's count, keeping known users; only when the count differs. */
+/**
+ * Aligns a tally with an authoritative snapshot count when they disagree. If the snapshot counts
+ * fewer than the users we saw live, some removals were missed: we can't tell whose, so forget them.
+ */
 function rebase(t: Tally, count: number): void {
-  if (tallyCount(t) !== count) t.baseline = Math.max(0, count - t.known.size);
+  if (tallyCount(t) === count) return;
+  if (count < t.known.size) {
+    t.known.clear();
+    t.baseline = count;
+  } else t.baseline = count - t.known.size;
 }
 
 function tallyAdd(t: Tally, user: string): void {
@@ -88,7 +97,7 @@ export function orderLines(lines: RawLine[]): RawLine[] {
 }
 
 export function emptyState(): ArchiveState {
-  return { guild: {}, channels: new Map(), messages: new Map(), memberSnapshots: new Map(), media: new Map() };
+  return { guild: {}, channels: new Map(), messages: new Map(), memberSnapshots: new Map(), media: new Map(), reactors: new Map() };
 }
 
 function upsertChannel(state: ArchiveState, c: any, selected?: boolean): void {
@@ -125,8 +134,10 @@ function setVotesFrom(ms: MessageState, poll: any): void {
   const finalized = !!poll.results.is_finalized;
   for (const a of counts) {
     const cur = ms.votes.get(a.id) ?? { baseline: 0, known: new Set<string>() };
-    if (finalized) cur.baseline = Math.max(0, (a.count ?? 0) - cur.known.size);
-    else rebase(cur, a.count ?? 0);
+    if (finalized && tallyCount(cur) !== (a.count ?? 0)) {
+      cur.known.clear();
+      cur.baseline = a.count ?? 0;
+    } else rebase(cur, a.count ?? 0);
     ms.votes.set(a.id, cur);
   }
 }
@@ -248,7 +259,10 @@ export function applyLine(state: ArchiveState, line: RawLine): void {
       const burst = !!d.burst;
       const key = reactionKey(d.emoji, burst);
       const r = ms.reactions.get(key) ?? { emoji: d.emoji, burst, baseline: 0, known: new Set<string>() };
-      if (line.t === "MESSAGE_REACTION_ADD") tallyAdd(r, d.user_id);
+      if (line.t === "MESSAGE_REACTION_ADD") {
+        tallyAdd(r, d.user_id);
+        if (d.member?.user?.id) state.reactors.set(d.member.user.id, { user: d.member.user, member: d.member, at: line.at });
+      }
       else tallyRemove(r, d.user_id);
       if (tallyCount(r) === 0) ms.reactions.delete(key);
       else ms.reactions.set(key, r);

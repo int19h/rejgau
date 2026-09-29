@@ -15,7 +15,8 @@ export interface MsgEnv {
   channelId: string;
 }
 
-const media = (env: MsgEnv, key: string | undefined) => (key ? env.file.media[key] ?? env.users?.media[key] ?? null : null);
+// Archived media URLs come from the (hand-editable) raw log, so they're checked like any other URL.
+const media = (env: MsgEnv, key: string | undefined) => (key ? safeUrl(env.file.media[key] ?? env.users?.media[key]) : null);
 
 function mdContext(env: MsgEnv, msg: any): MdContext {
   const roles = env.archive.guild.roles;
@@ -184,10 +185,11 @@ function Embed({ e, env, ctx }: { e: any; env: MsgEnv; ctx: MdContext }) {
 const BUTTON_STYLES = ["", "primary", "secondary", "success", "danger", "link", "premium"];
 
 function ComponentEmoji({ emoji, ctx }: { emoji: any; ctx: MdContext }) {
+  const [failed, setFailed] = useState(false);
   if (!emoji) return null;
   if (emoji.id) {
     const url = ctx.media(emojiRef(emoji.id, !!emoji.animated).key);
-    return url ? <img class="emoji" src={url} alt={`:${emoji.name}:`} /> : <span>:{emoji.name}:</span>;
+    return url && !failed ? <img class="emoji" src={url} alt={`:${emoji.name}:`} onError={() => setFailed(true)} /> : <span>:{emoji.name}:</span>;
   }
   return <span>{emoji.name}</span>;
 }
@@ -259,6 +261,9 @@ function Poll({ msg, ctx }: { msg: any; ctx: MdContext }) {
   for (const a of p.results?.answer_counts ?? []) counts[a.id] = a.count;
   for (const [id, v] of Object.entries<any>(msg.votes ?? {})) counts[id] = v.count;
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  // With multiple answers per voter, percentages of all votes would mislead; Discord divides by
+  // voters, which we only partly know. Show counts only.
+  const multi = !!p.allow_multiselect;
   const finalized = !!p.results?.is_finalized;
   return (
     <div class="poll">
@@ -272,7 +277,7 @@ function Poll({ msg, ctx }: { msg: any; ctx: MdContext }) {
             <span class="poll-label">
               <ComponentEmoji emoji={a.poll_media?.emoji} ctx={ctx} /> {a.poll_media?.text}
             </span>
-            <span class="poll-count">{n} ({pct}%)</span>
+            <span class="poll-count">{multi ? n : `${n} (${pct}%)`}</span>
           </div>
         );
       })}

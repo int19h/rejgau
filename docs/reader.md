@@ -30,7 +30,7 @@ archive repo                         rejgau repo (this one)
 - an hourly `schedule`;
 - `workflow_dispatch`.
 
-The build job is debounced with `concurrency` (cancel-in-progress). The deploy job is never cancelled.
+Overlapping builds are coalesced with `concurrency` (cancel-in-progress); the deploy job is never cancelled and alone has the Pages permissions. The bot's dispatch is throttled (at most one per 10 minutes).
 
 - **Why the build runs in CI:**
   - The generator is a pure function from raw to site. That keeps the bot append-only, and history rewrites need no special handling: every build is a full rebuild.

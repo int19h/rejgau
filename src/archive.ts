@@ -619,6 +619,12 @@ export class GuildArchive extends DurableObject<Env> {
           this.set("memberRetryAt", String(Date.now() + 60_000)); // try again later
           return;
         }
+        if (!(e instanceof DiscordError && e.status === 404 && /"code":\s*10007/.test(e.body))) {
+          // Some other refusal (e.g. no access): we learned nothing, so record nothing.
+          log("member_snapshot_skipped", { error: errorMessage(e) });
+          this.sql.exec(`UPDATE members SET done = 1 WHERE user_id = ?`, user_id);
+          continue;
+        }
         member = null; // 404 Unknown Member: no longer in the server
       }
       this.synthetic(guild, "MEMBER_SNAPSHOT", { user_id, member });

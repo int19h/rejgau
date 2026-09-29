@@ -23,8 +23,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
   build:
@@ -34,19 +32,19 @@ jobs:
       group: pages-build
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ vars.ARCHIVE_BRANCH || 'archive' }}
           path: archive
           fetch-depth: 1
           persist-credentials: false
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: int19h/rejgau
           ref: ${{ vars.REJGAU_REF || 'main' }}
           path: rejgau
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
@@ -55,13 +53,17 @@ jobs:
         working-directory: rejgau
       - run: npm run build:site -- --archive "../archive/${{ vars.ARCHIVE_PATH }}" --out ../site
         working-directory: rejgau
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: site
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    # Only the deploy job gets Pages rights; the build job runs third-party packages.
+    permissions:
+      pages: write
+      id-token: write
     concurrency:
       group: pages-deploy
       cancel-in-progress: false
@@ -70,4 +72,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

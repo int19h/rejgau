@@ -68,6 +68,17 @@ describe("fold: reactions and polls", () => {
     expect(tallyCount(v.get(2)!)).toBe(0);
   });
 
+  it("resets known users when a snapshot counts fewer than we saw", () => {
+    const st = fold([
+      gw("MESSAGE_CREATE", msg()),
+      gw("MESSAGE_REACTION_ADD", { message_id: "100", user_id: "a", emoji: { name: "👍" } }),
+      gw("MESSAGE_REACTION_ADD", { message_id: "100", user_id: "b", emoji: { name: "👍" } }),
+      rest(msg({ reactions: [{ emoji: { name: "👍" }, count: 1, count_details: { normal: 1, burst: 0 } }] })), // a removal was missed
+    ]);
+    const r = [...st.messages.get("100")!.reactions.values()][0];
+    expect(tallyCount(r)).toBe(1);
+  });
+
   it("treats finalized results as authoritative", () => {
     const st = fold([
       gw("MESSAGE_CREATE", msg({ poll: { answers: [], results: { answer_counts: [] } } })),

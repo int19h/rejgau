@@ -114,9 +114,10 @@ function CodeBlock({ lang, content }: { lang?: string; content: string }) {
 }
 
 function Emoji({ id, name, animated, ctx }: { id: string; name: string; animated?: boolean; ctx: MdContext }) {
+  const [failed, setFailed] = useState(false);
   const url = ctx.media(emojiRef(id, !!animated).key);
-  if (!url) return <span class="emoji-text">:{name}:</span>;
-  return <img class={ctx.jumbo ? "emoji jumbo" : "emoji"} src={url} alt={`:${name}:`} title={`:${name}:`} draggable={false} />;
+  if (!url || failed) return <span class="emoji-text">:{name}:</span>;
+  return <img class={ctx.jumbo ? "emoji jumbo" : "emoji"} src={url} alt={`:${name}:`} title={`:${name}:`} draggable={false} onError={() => setFailed(true)} />;
 }
 
 function Link({ href, children }: { href: unknown; children: ComponentChildren }) {

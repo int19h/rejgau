@@ -1,6 +1,6 @@
 // Turns folded archive state into the reader's data files. Pure: returns path → JSON value.
 
-import { avatarRef, guildIconRef, mediaInMessage, type MediaRef } from "../src/media";
+import { avatarRef, emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "../src/media";
 import { tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { normalizeText } from "../reader/src/text";
 
@@ -185,6 +185,8 @@ function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set
   }
 
   for (const r of mediaInMessage(m, ctx.guildId)) media.add(r.key);
+  // Reactions folded from live events aren't in the message snapshot.
+  for (const r of ms.reactions.values()) if (r.emoji?.id) media.add(emojiRef(r.emoji.id, !!r.emoji.animated).key);
   if (fallback?.avatar && m.author?.id) media.add(`gavatar-${ctx.guildId}-${m.author.id}-${fallback.avatar}.${String(fallback.avatar).startsWith("a_") ? "gif" : "png"}`);
   for (const e of ms.edits) for (const r of mediaInMessage({ ...e, id: m.id, channel_id: m.channel_id }, ctx.guildId)) media.add(r.key);
   return out;
@@ -293,6 +295,11 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
     include(c.parent_id, depth + 1);
   };
   for (const [id, ch] of state.channels) if (ch.selected) include(id);
+
+  // People seen only reacting still need names for reaction tooltips.
+  for (const [id, r] of state.reactors) {
+    if (!latestUsers.has(id)) noteUser(snapUser(r.user, r.member) ?? undefined, r.at);
+  }
 
   const users: Record<string, unknown> = {};
   const userMedia: Record<string, string | null> = {};

@@ -16,6 +16,7 @@ import {
 } from "./data";
 import { isGrouped, Message, type MsgEnv } from "./message";
 import { compileQuery, monthInBounds, parseQuery, type SearchRow } from "./search";
+import { safeUrl } from "./url";
 
 // --- routing ---
 
@@ -81,7 +82,7 @@ function Sidebar({ archive, current }: { archive: Archive; current?: string }) {
   return (
     <nav class="sidebar">
       <div class="guild">
-        {archive.guild.icon_url ? <img class="guild-icon" src={archive.guild.icon_url} alt="" /> : <span class="guild-icon placeholder">{(archive.guild.name ?? "?").slice(0, 1)}</span>}
+        {safeUrl(archive.guild.icon_url) ? <img class="guild-icon" src={safeUrl(archive.guild.icon_url)!} alt="" /> : <span class="guild-icon placeholder">{(archive.guild.name ?? "?").slice(0, 1)}</span>}
         <span class="guild-name">{archive.guild.name}</span>
       </div>
       <div class="channels">{(byParent.get(null) ?? []).map((c) => item(c, 0))}</div>

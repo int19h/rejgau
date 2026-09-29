@@ -88,8 +88,8 @@ export function displayName(u: UserSnap | undefined | null): string {
   return u.nick || u.global_name || u.username || "Unknown";
 }
 
-export function hexColor(n: number | undefined | null): string | undefined {
-  if (!n) return undefined;
+export function hexColor(n: unknown): string | undefined {
+  if (typeof n !== "number" || !Number.isInteger(n) || n <= 0 || n > 0xffffff) return undefined;
   return `#${n.toString(16).padStart(6, "0")}`;
 }
 

@@ -78,16 +78,18 @@ export function dateRange(value: string): [number, number] | null {
 function resolveUsers(value: string, ctx: SearchContext): Set<string> {
   const v = normalizeText(value.replace(/^@/, ""));
   const exact = new Set<string>();
+  const prefix = new Set<string>();
   const partial = new Set<string>();
   for (const [id, names] of ctx.userNames) {
     if (id === value) exact.add(id);
     for (const n of names) {
       const nn = normalizeText(n);
       if (nn === v) exact.add(id);
-      else if (nn.includes(v)) partial.add(id);
+      else if (nn.startsWith(v)) prefix.add(id);
+      else if (v.length >= 3 && nn.includes(v)) partial.add(id);
     }
   }
-  return exact.size ? exact : partial;
+  return exact.size ? exact : prefix.size ? prefix : partial;
 }
 
 function resolveChannels(value: string, ctx: SearchContext): Set<string> {
