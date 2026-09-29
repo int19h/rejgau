@@ -1,13 +1,13 @@
 # rejgau: design
 
-rejgau archives the public channels of a Discord server into a git repository. It also ships a static, Discord-like reader with search.
+rejgau archives selected channels of a Discord server into a git repository. It also ships a static, Discord-like reader with search.
 
 Status: design agreed; feasibility spike done (see [Spike results](#spike-results-2026-09-29)). Research date: 2026-09-29.
 
 ## Goals and non-goals
 
 **Goals**
-- Keep a verbatim raw record of everything the bot can observe in selected public channels. This includes metadata, edits, deletes, reactions, polls, threads, and responses from other apps.
+- Keep a verbatim raw record of everything the bot can observe in the selected channels. This includes metadata, edits, deletes, reactions, polls, threads, and responses from other apps.
 - Make the archive outlive its operator. Logs and media live on the git host (GitHub first), not in the operator's paid infrastructure. The bot is just a writer.
 - Provide a static reader that works from GitHub Pages. It renders messages close to how Discord does, read-only, and supports Discord search syntax.
 - Keep the code generic, so anyone can run their own deployment.
@@ -25,12 +25,12 @@ Discord Gateway ──ws──► Cloudflare Worker "rejgau" (workers.dev, Worke
                          ├─ DO GatewaySession   one per bot: socket, heartbeat alarm, resume, routing
                          ├─ DO GuildArchive     one per guild: SQLite buffer + state, flush alarm,
                          │                      commits via GitHub App (Git Data API)
-                         ├─ /interactions       our admin slash commands (Ed25519-verified)
-                         └─ media fetcher       Worker-direct if Discord's CDN allows it, otherwise
-                                                a GitHub Action triggered via repository_dispatch
+                         │                      and uploads media as release assets
+                         ├─ /status, /flush     admin HTTP endpoints (ADMIN_KEY)
+                         └─ cron */5            ensures the Gateway session is running
 
-GitHub: <server>-archive (public)
-  branch main      README, workflows (thin wrappers around rejgau's reusable workflows)
+GitHub: <server>-archive (public or private)
+  branch main      README (+ later: Pages workflow)
   branch archive   the logs; see "Archive layout". Written only by the bot; may be force-pushed by the admin.
   releases         media-YYYY-MM[.n]: attachments, avatars, emoji and stickers as release assets
   pages            reader + archive data, deployed by Actions on push to `archive`
@@ -50,18 +50,21 @@ GitHub: <server>-archive (public)
 - **REST pacing**
   - Honour the `X-RateLimit-*` headers and never retry-storm.
   - Workers share egress IPs, and Discord bans per IP after 10k invalid requests (401, 403 or 429) in 10 minutes. Backfill is the risky path, so it runs slowly.
-- **Secrets:** the Discord bot token, the GitHub App private key and the app ID. Per-guild config lives in `GuildArchive` storage and is set with admin slash commands.
+- **Configuration** (see the README for the exact schema):
+  - Secrets: `DISCORD_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `ADMIN_KEY`.
+  - Variables: `GITHUB_APP_ID`, and `REJGAU_CONFIG`, a JSON object mapping each guild to its repo, branch, folder, channel selection and backfill flag.
+  - Variables are managed in the Cloudflare dashboard (`keep_vars`). Changing them redeploys, which restarts the Durable Objects; the session just resumes.
+  - Admin slash commands are deferred: at this scale, editing one JSON variable is simpler than running an Interactions endpoint.
 
 ### Discord
 
-- **Install** with `scope=bot applications.commands`, `integration_type=0`, `permissions=66560` (View Channel + Read Message History). Add Connect (1115136 total) if voice-channel text history backfill is wanted. The bot sends nothing, so it needs no send permissions.
+- **Install** with `scope=bot`, `integration_type=0`, `permissions=66560` (View Channel + Read Message History). Add Connect (1115136 total) if voice-channel text history backfill is wanted. The bot sends nothing, so it needs no send permissions.
 - **Intents:** `GUILDS`, `GUILD_EXPRESSIONS`, `GUILD_MESSAGES`, `GUILD_MESSAGE_REACTIONS`, `MESSAGE_CONTENT` (privileged; a portal toggle below 10k users), `GUILD_MESSAGE_POLLS`. `GUILD_SCHEDULED_EVENTS` is optional.
-- **Channel selection has three gates:**
-  1. Discord permissions. The admin controls what the bot's role can see. From 2026-11-16, channels the bot can't view arrive obfuscated (`___hidden___`).
-  2. Explicit opt-in with `/archive enable #channel`, which requires Manage Server.
-  3. A public check: the bot refuses unless `@everyone` effectively has View Channel, computed from the guild's @everyone permissions plus the channel's @everyone overwrite.
+- **Channel selection.** "Public" is a server convention, not a Discord permission bit. For example, the main server keeps most channels hidden from @everyone until members pass a bot check. So the bot archives **any** channel it can see and that the config selects, private or not:
+  1. Discord permissions decide what the bot *can* see. The admin grants the bot's role View Channel + Read Message History wherever archiving is wanted. From 2026-11-16, channels the bot can't view arrive obfuscated (`___hidden___`, flag 1<<17) and are ignored.
+  2. `REJGAU_CONFIG` decides what it *does* archive: `"channels": "all"`, or a list of channel and/or category IDs. A category includes all its current and future channels. An optional `exclude` list applies on top.
 
-  Public threads (including forum posts) of enabled channels are included automatically. Private threads never are.
+  Threads (public, private the bot can see, and forum posts) are included when their parent channel is.
 - **Captured events**
   - Messages: create, update, delete, delete-bulk.
   - Reactions: add, remove, remove-all, remove-emoji.
@@ -86,9 +89,10 @@ Everything below lives under a configurable folder on the `archive` branch. All 
   archive.json                  { format: 1, guild_id, generator, … }
   guild.json                    latest guild snapshot: name, icon, roles, emoji, stickers
   channels.json                 id → latest channel/thread object for every archived channel & thread
-  users.json                    id → latest user/member info seen (username, global_name, avatar, nick, bot)
   media.json                    media index: see "Media"
   raw/YYYY/MM/DD.jsonl          RAW: every gateway dispatch received that day, verbatim, in order
+  -- phase 2 (reader), generated from raw/:
+  users.json                    id → latest user/member info seen (username, global_name, avatar, nick, bot)
   view/<channel_id>/YYYY-MM.json DERIVED: reader data for messages created that month in that channel
   manifest.json                 reader entry point: channels, months available, counts, sizes
 ```
@@ -101,10 +105,14 @@ Everything below lives under a configurable folder on the `archive` branch. All 
   ```
 - `src` is one of:
   - `gw`: live Gateway dispatch.
-  - `rest`: backfill or catch-up. `t` is `MESSAGE_CREATE` and `d` is the REST message object.
-  - `rejgau`: synthetic records such as `GAP`, `CHANNEL_ENABLED`, `CHANNEL_DISABLED` and `RESTART`.
-- Only events concerning archived channels (and guild-level events needed for rendering) are written. Events for other channels are dropped at the router.
-- A day's file is append-only while the day is current. The bot never rewrites past days' raw files.
+  - `rest`: backfill or catch-up. `t` is `MESSAGE_CREATE` and `d` is the REST message object. These lines go into the file for the day the message was *created*, not the day it was fetched, so backfilled history lands where a reader expects it.
+  - `rejgau`: synthetic records:
+    - `GUILD_SNAPSHOT`: written instead of the raw `GUILD_CREATE`, and with no `channels`, `threads`, `members`, `presences` or `voice_states`. The raw `GUILD_CREATE` lists every channel the bot can see, which would leak the names of channels that aren't archived.
+    - `CHANNEL_SNAPSHOT`: the channel or thread object when it first becomes archived.
+    - `CATCHUP_BEGIN` / `CATCHUP_END`: bracket REST catch-up after a lost session.
+- Only events concerning archived channels (and guild-level events needed for rendering) are written. Events for other channels, including `CHANNEL_*`/`THREAD_*` for them, are dropped.
+- Delivery is at-least-once: after a crash, events may be replayed and REST catch-up may repeat live messages. Consumers dedupe by message ID and event content.
+- Live events only append to the current day's file. Backfill appends to past days' files.
 - At ~100 messages a day, a day file is ~200–400 KB, and ~100 MB a year uncompressed. Git's delta compression makes the repository much smaller than that.
 
 ### Derived view (regenerable)
@@ -127,8 +135,18 @@ Everything below lives under a configurable folder on the `archive` branch. All 
   - Download URLs redirect to signed blob URLs that `<img>`/`<video>`/`<audio>` load directly and that support byte ranges. There's no CORS, so other file types are download links in the reader.
 - **Releases:** one per month, `media-YYYY-MM`, rolling over to `media-YYYY-MM.2` at 1000 assets. Expected volume is ≤10 images a day, ~300 a month.
   - Their tags point at a dedicated parentless **media-root commit**, never into `archive` history. A history rewrite then never has tags pinning old log content.
-- **What's archived:** attachments, embed images and thumbnails (`proxy_url`), sticker images, custom emoji, user avatars, and the guild icon. Assets are content-addressed (`<sha256>.<ext>`) to deduplicate avatars and emoji.
-- **Index:** `media.json` maps each source (attachment ID, `emoji:<id>`, `avatar:<user>/<hash>`, …) to `{ sha256, size, type, release, asset }`.
+- **What's archived:** attachments (including Components V2 media), embed images and thumbnails (from the original URL), sticker images, custom emoji (in content and reactions), user and member avatars, and the guild icon.
+- **Asset names** come from Discord identity, not a content hash. This lets the Worker stream downloads straight into the upload without buffering, within its 128 MB memory limit:
+  - `att-<attachment_id>-<filename>`
+  - `emoji-<id>.<png|gif>`
+  - `sticker-<id>.<png|json>`
+  - `avatar-<user_id>-<hash>.<png|gif>`
+  - `embed-<sha256(url)[:16]>.<ext>`
+  - `guild-<id>-<hash>.png`
+
+  Avatars and emoji dedupe naturally, since Discord's hash changes when the image changes.
+- **Index:** `media.json` maps each source key (the asset name without the release) to `{ url, release, name, size, type }` or `{ error }`. The reader resolves any Discord media reference through it.
+- **Size cap:** files above `maxMediaBytes` (default 100 MB) are recorded as `{ error: "too_large" }`.
 - **Fetcher**
   - Attachment URLs are signed and expire (the lifetime is undocumented; historically 24 h), so media is fetched at ingest.
   - The spike showed that Workers **can** fetch from `cdn.discordapp.com`: real signed attachments, avatars, custom emoji, and PNG/APNG/Lottie stickers (`cdn.discordapp.com/stickers/{id}.png|json`). Discord's docs claiming a 403 are outdated.
@@ -200,7 +218,7 @@ The admin may rewrite `archive` history at any time, for example to remove messa
 
 ## Spike results (2026-09-29)
 
-The spike is in `spike/`. It was deployed to Workers Paid as `rejgau-spike` and connected to the test server.
+The spike lived in `spike/` (removed after it served its purpose; see commit `b069b37`). It was deployed to Workers Paid as `rejgau-spike` and connected to the test server.
 
 - **Gateway from a Durable Object works.** HELLO arrives about 50 ms after the upgrade, and IDENTIFY/READY and heartbeats work.
 - **Restarts and resume.** Over the first ~3.5 h the Durable Object restarted 4 times, with no deploys. Each time the alarm reconnected and RESUMEd successfully, with 0 re-identifies and 0 zombie connections. Restarts are routine, so resume must be solid, and the gap-detection path is still required for when resume fails.
@@ -215,6 +233,15 @@ The spike is in `spike/`. It was deployed to Workers Paid as `rejgau-spike` and 
   - User objects carry many cosmetic fields (`collectibles`, `primary_guild`, `avatar_decoration_data`, …). They are kept verbatim in raw, and the reader ignores what it doesn't render.
 - **User-installed apps work.** A command from an app installed only for the user (not in the server) produced a normal `MESSAGE_CREATE` (LOADING) and `MESSAGE_UPDATE`. They carry `interaction_metadata.name` and `authorizing_integration_owners: {"1": <user id>}`, with no `"0"` (guild) key, which distinguishes them from guild-installed apps.
 
+## Implementation phases
+
+1. **Bot (this phase).** Gateway session, routing, raw logs, snapshots, media, catch-up and backfill, commits.
+   - Backfill pages forward from the start of each selected channel and its active threads, paced.
+   - Archived threads are not backfilled yet.
+2. **Reader.** Derived `view/`, `users.json` and `manifest.json` (generated by a GitHub Action from `raw/`, so the bot stays simple), the static reader, and a Pages workflow.
+   - Pages and release-asset images require a **public** repo (or a paid plan for Pages on private repos; private release assets need auth to view).
+
 Later:
-- Backfill of existing history when a channel is enabled: on by default, paced.
+- Archived-thread backfill.
+- Admin slash commands.
 - The helper for manual deletion surgery.
