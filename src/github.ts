@@ -1,0 +1,360 @@
+// Minimal GitHub REST client for a GitHub App installed on the archive repo.
+
+import { log } from "./util";
+
+const API = "https://api.github.com";
+const UPLOADS = "https://uploads.github.com";
+
+export class GitHubError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: string,
+    what: string,
+  ) {
+    super(`GitHub ${what} failed: ${status} ${body.slice(0, 300)}`);
+  }
+}
+
+/** The branch moved (or appeared) between reading it and updating it. */
+export class ConflictError extends Error {}
+
+export interface FileChange {
+  path: string;
+  content: string;
+}
+
+export interface Release {
+  id: number;
+  tag_name: string;
+}
+
+export interface Asset {
+  id: number;
+  name: string;
+  size: number;
+  content_type: string;
+  state: string;
+  browser_download_url: string;
+}
+
+// --- App authentication -------------------------------------------------------------------------
+
+function b64url(data: ArrayBuffer | Uint8Array | string): string {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function derLength(n: number): number[] {
+  if (n < 0x80) return [n];
+  const out: number[] = [];
+  while (n > 0) {
+    out.unshift(n & 0xff);
+    n >>= 8;
+  }
+  return [0x80 | out.length, ...out];
+}
+
+function der(tag: number, content: Uint8Array): Uint8Array {
+  const len = derLength(content.length);
+  const out = new Uint8Array(1 + len.length + content.length);
+  out[0] = tag;
+  out.set(len, 1);
+  out.set(content, 1 + len.length);
+  return out;
+}
+
+function concat(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let i = 0;
+  for (const p of parts) {
+    out.set(p, i);
+    i += p.length;
+  }
+  return out;
+}
+
+/**
+ * DER bytes of a PKCS#8 private key from a PEM. GitHub hands out PKCS#1 ("BEGIN RSA PRIVATE KEY"),
+ * which WebCrypto can't import, so it gets wrapped into PKCS#8 here.
+ */
+export function pemToPkcs8(pem: string): Uint8Array {
+  const m = /-----BEGIN ((?:RSA )?PRIVATE KEY)-----([\s\S]+?)-----END \1-----/.exec(pem.replace(/\\n/g, "\n"));
+  if (!m) throw new Error("GITHUB_APP_PRIVATE_KEY is not a PEM private key");
+  const body = Uint8Array.from(atob(m[2].replace(/\s+/g, "")), (c) => c.charCodeAt(0));
+  if (m[1] === "PRIVATE KEY") return body;
+  const version = Uint8Array.of(0x02, 0x01, 0x00);
+  // SEQUENCE { OID 1.2.840.113549.1.1.1 (rsaEncryption), NULL }
+  const algorithm = Uint8Array.of(0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00);
+  return der(0x30, concat(version, algorithm, der(0x04, body)));
+}
+
+async function appJwt(appId: string, privateKeyPem: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToPkcs8(privateKeyPem),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const now = Math.floor(Date.now() / 1000);
+  const unsigned = `${b64url(JSON.stringify({ alg: "RS256", typ: "JWT" }))}.${b64url(
+    JSON.stringify({ iat: now - 60, exp: now + 540, iss: appId }),
+  )}`;
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(unsigned));
+  return `${unsigned}.${b64url(sig)}`;
+}
+
+// Installation tokens are cached per isolate, keyed by repo.
+const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+
+// --- Client -------------------------------------------------------------------------------------
+
+export class GitHub {
+  readonly owner: string;
+  readonly name: string;
+
+  constructor(
+    private readonly appId: string,
+    private readonly privateKey: string,
+    readonly repo: string,
+  ) {
+    [this.owner, this.name] = repo.split("/");
+  }
+
+  private async token(): Promise<string> {
+    const cached = tokenCache.get(this.repo);
+    if (cached && cached.expiresAt - Date.now() > 5 * 60_000) return cached.token;
+    const jwt = await appJwt(this.appId, this.privateKey);
+    const inst = await this.raw("GET", `/repos/${this.repo}/installation`, undefined, `Bearer ${jwt}`);
+    if (!inst.ok) throw new GitHubError(inst.status, await inst.text(), "installation lookup (is the App installed on the repo?)");
+    const { id } = (await inst.json()) as { id: number };
+    const res = await this.raw(
+      "POST",
+      `/app/installations/${id}/access_tokens`,
+      { repositories: [this.name], permissions: { contents: "write", metadata: "read" } },
+      `Bearer ${jwt}`,
+    );
+    if (!res.ok) throw new GitHubError(res.status, await res.text(), "installation token");
+    const t = (await res.json()) as { token: string; expires_at: string };
+    tokenCache.set(this.repo, { token: t.token, expiresAt: Date.parse(t.expires_at) });
+    return t.token;
+  }
+
+  private async raw(method: string, pathOrUrl: string, body?: unknown, auth?: string, accept = "application/vnd.github+json"): Promise<Response> {
+    const url = pathOrUrl.startsWith("https://") ? pathOrUrl : API + pathOrUrl;
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(url, {
+        method,
+        headers: {
+          Accept: accept,
+          Authorization: auth ?? `Bearer ${await this.token()}`,
+          "User-Agent": "rejgau",
+          "X-GitHub-Api-Version": "2022-11-28",
+          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+      if (res.status >= 500 && attempt < 2) {
+        await res.body?.cancel();
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        continue;
+      }
+      return res;
+    }
+  }
+
+  private async json<T>(method: string, path: string, body: unknown, what: string): Promise<T> {
+    const res = await this.raw(method, path, body);
+    if (!res.ok) throw new GitHubError(res.status, await res.text(), what);
+    return (await res.json()) as T;
+  }
+
+  private repoPath(p: string): string {
+    return `/repos/${this.repo}${p}`;
+  }
+
+  /** Head commit SHA of a branch, or null if the branch doesn't exist. */
+  async branchHead(branch: string): Promise<string | null> {
+    const res = await this.raw("GET", this.repoPath(`/git/ref/heads/${encodeURIComponent(branch)}`));
+    if (res.status === 404 || res.status === 409) {
+      await res.body?.cancel();
+      return null;
+    }
+    if (!res.ok) throw new GitHubError(res.status, await res.text(), `read branch ${branch}`);
+    return ((await res.json()) as { object: { sha: string } }).object.sha;
+  }
+
+  /** Text of a file at a commit, or null if absent. */
+  async readFile(path: string, ref: string): Promise<string | null> {
+    const encoded = path.split("/").map(encodeURIComponent).join("/");
+    const res = await this.raw("GET", this.repoPath(`/contents/${encoded}?ref=${ref}`), undefined, undefined, "application/vnd.github.raw+json");
+    if (res.status === 404) {
+      await res.body?.cancel();
+      return null;
+    }
+    if (!res.ok) throw new GitHubError(res.status, await res.text(), `read ${path}`);
+    return await res.text();
+  }
+
+  /**
+   * Commits `files` on top of `parent` (null = create the branch as an orphan) and moves the branch
+   * there without forcing. Throws ConflictError if the branch moved meanwhile.
+   */
+  async commit(branch: string, parent: string | null, files: FileChange[], message: string): Promise<string> {
+    await this.ensureNotEmpty();
+    const baseTree = parent
+      ? (await this.json<{ tree: { sha: string } }>("GET", this.repoPath(`/git/commits/${parent}`), undefined, "read commit")).tree.sha
+      : undefined;
+    const tree = [];
+    for (const f of files) {
+      if (f.content.length > 512 * 1024) {
+        // Keep the tree request small; large files go through the blobs endpoint.
+        const blob = await this.json<{ sha: string }>("POST", this.repoPath("/git/blobs"), { content: f.content, encoding: "utf-8" }, "create blob");
+        tree.push({ path: f.path, mode: "100644", type: "blob", sha: blob.sha });
+      } else {
+        tree.push({ path: f.path, mode: "100644", type: "blob", content: f.content });
+      }
+    }
+    const newTree = await this.json<{ sha: string }>("POST", this.repoPath("/git/trees"), { base_tree: baseTree, tree }, "create tree");
+    const commit = await this.json<{ sha: string }>(
+      "POST",
+      this.repoPath("/git/commits"),
+      { message, tree: newTree.sha, parents: parent ? [parent] : [] },
+      "create commit",
+    );
+    const res = parent
+      ? await this.raw("PATCH", this.repoPath(`/git/refs/heads/${encodeURIComponent(branch)}`), { sha: commit.sha, force: false })
+      : await this.raw("POST", this.repoPath("/git/refs"), { ref: `refs/heads/${branch}`, sha: commit.sha });
+    if (res.status === 422 || res.status === 409) throw new ConflictError(`branch ${branch} moved: ${await res.text()}`);
+    if (!res.ok) throw new GitHubError(res.status, await res.text(), "update branch");
+    await res.body?.cancel();
+    return commit.sha;
+  }
+
+  private notEmpty = false;
+
+  /** The Git Data API doesn't work on a repo with no commits at all; seed one via the Contents API. */
+  private async ensureNotEmpty(): Promise<void> {
+    if (this.notEmpty) return;
+    const res = await this.raw("GET", this.repoPath("/commits?per_page=1"));
+    if (res.status === 409) {
+      await res.body?.cancel();
+      log("github_seed_empty_repo", { repo: this.repo });
+      await this.json("PUT", this.repoPath("/contents/README.md"), {
+        message: "Initialize archive repository",
+        content: btoa("# Discord archive\n\nWritten by [rejgau](https://github.com/int19h/rejgau). Logs are on the `archive` branch.\n"),
+      }, "seed empty repo");
+    } else if (!res.ok) {
+      throw new GitHubError(res.status, await res.text(), "check repo");
+    } else {
+      await res.body?.cancel();
+    }
+    this.notEmpty = true;
+  }
+
+  /** SHA of the parentless commit that media release tags point at; created on first use. */
+  async mediaRoot(): Promise<string> {
+    const res = await this.raw("GET", this.repoPath("/git/ref/tags/media-root"));
+    if (res.ok) return ((await res.json()) as { object: { sha: string } }).object.sha;
+    await res.body?.cancel();
+    await this.ensureNotEmpty();
+    const tree = await this.json<{ sha: string }>(
+      "POST",
+      this.repoPath("/git/trees"),
+      {
+        tree: [
+          {
+            path: "README.md",
+            mode: "100644",
+            type: "blob",
+            content:
+              "# Media root\n\nThis parentless commit anchors the `media-*` release tags that hold archived Discord media.\n" +
+              "It is kept outside the `archive` branch so that rewriting archive history never touches release tags.\n",
+          },
+        ],
+      },
+      "create media-root tree",
+    );
+    const commit = await this.json<{ sha: string }>("POST", this.repoPath("/git/commits"), { message: "Media root", tree: tree.sha, parents: [] }, "create media-root commit");
+    const ref = await this.raw("POST", this.repoPath("/git/refs"), { ref: "refs/tags/media-root", sha: commit.sha });
+    if (ref.status === 422) {
+      await ref.body?.cancel();
+      return this.mediaRoot(); // created concurrently
+    }
+    if (!ref.ok) throw new GitHubError(ref.status, await ref.text(), "create media-root tag");
+    await ref.body?.cancel();
+    return commit.sha;
+  }
+
+  /** Creates a lightweight tag; a no-op if it already exists. */
+  async ensureTag(tag: string, sha: string): Promise<void> {
+    const res = await this.raw("POST", this.repoPath("/git/refs"), { ref: `refs/tags/${tag}`, sha });
+    if (!res.ok && res.status !== 422) throw new GitHubError(res.status, await res.text(), `create tag ${tag}`);
+    await res.body?.cancel();
+  }
+
+  async releaseByTag(tag: string): Promise<Release | null> {
+    const res = await this.raw("GET", this.repoPath(`/releases/tags/${encodeURIComponent(tag)}`));
+    if (res.status === 404) {
+      await res.body?.cancel();
+      return null;
+    }
+    if (!res.ok) throw new GitHubError(res.status, await res.text(), `read release ${tag}`);
+    return (await res.json()) as Release;
+  }
+
+  async createRelease(tag: string, target: string, body: string): Promise<Release> {
+    return this.json<Release>(
+      "POST",
+      this.repoPath("/releases"),
+      { tag_name: tag, target_commitish: target, name: tag, body, make_latest: "false" },
+      `create release ${tag}`,
+    );
+  }
+
+  async listAssets(releaseId: number): Promise<Asset[]> {
+    const all: Asset[] = [];
+    for (let page = 1; ; page++) {
+      const batch = await this.json<Asset[]>("GET", this.repoPath(`/releases/${releaseId}/assets?per_page=100&page=${page}`), undefined, "list assets");
+      all.push(...batch);
+      if (batch.length < 100) return all;
+    }
+  }
+
+  async deleteAsset(assetId: number): Promise<void> {
+    const res = await this.raw("DELETE", this.repoPath(`/releases/assets/${assetId}`));
+    if (!res.ok && res.status !== 404) throw new GitHubError(res.status, await res.text(), "delete asset");
+    await res.body?.cancel();
+  }
+
+  /** Uploads a release asset. Returns null if an asset with that name already exists. */
+  async uploadAsset(releaseId: number, name: string, contentType: string, length: number, body: ReadableStream | ArrayBuffer): Promise<Asset | null> {
+    let payload: ReadableStream | ArrayBuffer = body;
+    if (body instanceof ReadableStream) {
+      // GitHub requires Content-Length; a FixedLengthStream makes fetch send it instead of chunking.
+      const fixed = new FixedLengthStream(length);
+      body.pipeTo(fixed.writable).catch(() => {});
+      payload = fixed.readable;
+    }
+    const res = await fetch(`${UPLOADS}/repos/${this.repo}/releases/${releaseId}/assets?name=${encodeURIComponent(name)}`, {
+      method: "POST",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${await this.token()}`,
+        "User-Agent": "rejgau",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": contentType,
+      },
+      body: payload,
+    });
+    if (res.status === 422) {
+      const text = await res.text();
+      if (text.includes("already_exists")) return null;
+      throw new GitHubError(422, text, `upload ${name}`);
+    }
+    if (!res.ok) throw new GitHubError(res.status, await res.text(), `upload ${name}`);
+    return (await res.json()) as Asset;
+  }
+}

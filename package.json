@@ -1,0 +1,19 @@
+{
+  "name": "rejgau",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/unit && tsc --noEmit -p test/worker",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260929.1",
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.143.0",
+    "@cloudflare/vitest-plugin": "^1.0.0"
+  }
+}

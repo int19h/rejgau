@@ -86,12 +86,12 @@ Everything below lives under a configurable folder on the `archive` branch. All 
 
 ```
 <folder>/
-  archive.json                  { format: 1, guild_id, generator, … }
-  guild.json                    latest guild snapshot: name, icon, roles, emoji, stickers
-  channels.json                 id → latest channel/thread object for every archived channel & thread
-  media.json                    media index: see "Media"
-  raw/YYYY/MM/DD.jsonl          RAW: every gateway dispatch received that day, verbatim, in order
-  -- phase 2 (reader), generated from raw/:
+  archive.json                  { format: 1, guild_id, generator }
+  raw/YYYY/MM/DD.jsonl          RAW: every archived event, verbatim, plus rejgau records (the bot only appends here)
+  -- phase 2 (reader), generated from raw/ by a GitHub Action:
+  guild.json                    latest guild snapshot (from GUILD_SNAPSHOT / GUILD_UPDATE / role & emoji events)
+  channels.json                 id → latest object of every archived channel & thread and their ancestors
+  media.json                    media index (from MEDIA_STORED / MEDIA_FAILED records)
   users.json                    id → latest user/member info seen (username, global_name, avatar, nick, bot)
   view/<channel_id>/YYYY-MM.json DERIVED: reader data for messages created that month in that channel
   manifest.json                 reader entry point: channels, months available, counts, sizes
@@ -145,7 +145,8 @@ Everything below lives under a configurable folder on the `archive` branch. All 
   - `guild-<id>-<hash>.png`
 
   Avatars and emoji dedupe naturally, since Discord's hash changes when the image changes.
-- **Index:** `media.json` maps each source key (the asset name without the release) to `{ url, release, name, size, type }` or `{ error }`. The reader resolves any Discord media reference through it.
+- **Keys** as implemented: `att-<attachment_id>-<filename>`, `ext-<fnv64(url)>.<ext>` (embed images and external media), `emoji-<id>.<png|gif>`, `sticker-<id>.<png|json|gif>`, `avatar-<user>-<hash>.<png|gif>`, `gavatar-<guild>-<user>-<hash>.<ext>` and `guild-<id>-<hash>.<ext>`. The reader computes the key for any Discord media reference the same way (`src/media.ts`).
+- **Index:** each upload is recorded in raw as `MEDIA_STORED {key, release, name, url, size, content_type}` or `MEDIA_FAILED {key, reason}`. Phase 2 folds these into `media.json`.
 - **Size cap:** files above `maxMediaBytes` (default 100 MB) are recorded as `{ error: "too_large" }`.
 - **Fetcher**
   - Attachment URLs are signed and expire (the lifetime is undocumented; historically 24 h), so media is fetched at ingest.
@@ -176,7 +177,8 @@ Everything below lives under a configurable folder on the `archive` branch. All 
 The admin may rewrite `archive` history at any time, for example to remove messages on request. The writer and all readers must tolerate that:
 
 - **Never assume the previous commit is an ancestor.** Each flush reads the current head and builds on it. If the ref update fails because the head moved, it re-reads and retries. It does not force.
-- **Never append from a cache.** Before rewriting a file (today's raw file, a view month, `users.json`, `media.json`), read the *current tip version* and apply the change to that. This way a manual redaction is never resurrected by the bot's in-memory copy. Comparing blob SHAs with what the bot last wrote makes this cheap in the common case.
+- **Pause for surgery.** `POST /pause` stops commits (events keep buffering); the procedure is pause → flush → rewrite → force-push → resume.
+- **Never append from a cache.** Before appending to a day file, read the *current tip version* and append to that. This way a manual redaction is never resurrected by the bot's in-memory copy. Comparing blob SHAs with what the bot last wrote makes this cheap in the common case.
 - **Readers (Actions, Pages, the reader) process the files at the tip, never commit ranges or diffs.** Work must be idempotent: "which media sources lack an index entry", not "what changed since commit X".
 - Release tags live on the media-root commit, so a rewrite never needs to touch them.
 - **Deletion procedure** (documented in the archive repo's README, possibly with a helper script later):

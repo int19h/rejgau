@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rejgau",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  // GITHUB_APP_ID and REJGAU_CONFIG are managed in the Cloudflare dashboard; don't clobber them on deploy.
+  "keep_vars": true,
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "durable_objects": {
+    "bindings": [
+      { "name": "GATEWAY", "class_name": "GatewaySession" },
+      { "name": "GUILD", "class_name": "GuildArchive" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GatewaySession", "GuildArchive"] }],
+  "observability": { "enabled": true }
+  // Secrets: DISCORD_TOKEN, GITHUB_APP_PRIVATE_KEY, ADMIN_KEY
+}
