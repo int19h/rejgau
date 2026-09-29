@@ -1,0 +1,10 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "lib": ["ES2022", "DOM"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact"
+  },
+  "include": [".", "../src/media.ts", "../src/util.ts", "../reader/src/text.ts"]
+}

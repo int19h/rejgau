@@ -4,7 +4,7 @@ rejgau archives Discord channels into a git repository. A Cloudflare Worker keep
 
 The archive is meant to outlive whoever runs the bot. All data ends up in the GitHub repo; Cloudflare only buffers it.
 
-Status: phase 1 (the bot). The static reader with search is phase 2. See [docs/design.md](docs/design.md) for the design and the reasoning behind it.
+Status: the bot (phase 1) and the static reader with search (phase 2) are both implemented. See [docs/design.md](docs/design.md) for the design and the reasoning behind it.
 
 ## What ends up in the repo
 
@@ -136,7 +136,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://rejgau.<your-subdomai
       "path": "",
       "channels": ["<category or channel id>", "…"],
       "exclude": ["<channel id>"],
-      "backfill": true
+      "backfill": true,
+      "pages": false
     }
   },
   "flushIdleSeconds": 120,
@@ -149,6 +150,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://rejgau.<your-subdomai
 - **`channels`**: `"all"` (every channel the bot can see), or a list of channel and/or category IDs. A category covers its current and future channels. Threads and forum posts follow their parent.
 - **`exclude`**: IDs to skip. These take precedence, and apply to descendants too.
 - **`backfill`**: when a channel becomes selected, fetch its whole history. Active threads are included; archived threads aren't yet.
+- **`pages`**: after commits, send a `repository_dispatch` (`archive-updated`) to the archive repo, at most once per 10 minutes, so the Pages workflow republishes the reader.
 - **`path`**: a folder inside the branch. `""` is the repo root.
 - **`branch`**: defaults to `archive`. It's created if missing.
 - **`flushIdleSeconds` / `flushMaxSeconds`**: commit after this long without new events, or at most this long after the first uncommitted one.
@@ -181,6 +183,34 @@ Deletion is manual, by the archive admin:
 The bot always builds its next commit on the current branch tip and never force-pushes, so your rewrite stands. It doesn't re-fetch history it has already archived, but later events about a removed message (an edit or a reaction) are still logged as they happen.
 
 Anyone with a clone of the archive must `git fetch --force` / reset after a rewrite. Old commits can stay reachable on GitHub by SHA until GitHub garbage-collects them; GitHub Support can purge them.
+
+## Reader
+
+`reader/` is a static, read-only, Discord-like viewer with search. `tools/build.ts` turns an archive's `raw/` into the data files it loads. See [docs/reader.md](docs/reader.md).
+
+**Build locally** from a clone of the archive branch:
+
+```sh
+npm run build:site -- --archive ../my-archive --out site
+npx serve site    # or any static file server
+```
+
+**Publish on GitHub Pages:**
+1. Copy [`templates/pages.yml`](templates/pages.yml) to `.github/workflows/pages.yml` on the archive repo's **default branch**.
+2. Set **Settings → Pages → Source** to *GitHub Actions*.
+3. Add `"pages": true` to the guild's config so the bot triggers a rebuild after commits. An hourly schedule also covers it.
+
+A Pages site is **public even for a private repo**, except on GitHub Enterprise Cloud with access control. Media stored in a private repo's releases can't be displayed by the reader; it shows as links that signed-in viewers can open.
+
+**Search** understands Discord's syntax:
+- `from:`, `mentions:`: any name the user has had;
+- `in:`: a channel name;
+- `has:`: link, embed, file, image, video, sound, sticker, poll or forward;
+- `before:`, `after:`, `during:`: `YYYY`, `YYYY-MM` or `YYYY-MM-DD` in your local time zone, with before/after excluding the named day;
+- `pinned:`, `authorType:`;
+- `-` negation and `"phrases"`.
+
+Anything else is case- and accent-insensitive text matching.
 
 ## Development
 

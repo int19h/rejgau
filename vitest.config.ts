@@ -11,7 +11,7 @@ export const TEST_GUILDS = ["101", "102", "103", "104", "105", "106", "107", "10
 const guildConfig = (g: string) =>
   g === "108"
     ? { repo: `o/r${g}`, channels: "all", exclude: ["30"], backfill: false }
-    : { repo: `o/r${g}`, channels: ["10"], exclude: ["13"], backfill: g !== "101" && g !== "109" };
+    : { repo: `o/r${g}`, channels: ["10"], exclude: ["13"], backfill: g !== "101" && g !== "109", pages: g === "102" };
 
 export default defineConfig({
   test: {

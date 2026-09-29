@@ -24,6 +24,8 @@ export class FakeRepo {
   blobs = new Map<string, string>();
   releases: { id: number; tag_name: string; assets: { id: number; name: string; size: number; content_type: string; state: string }[] }[] = [];
   requests: string[] = [];
+  /** repository_dispatch event types received. */
+  dispatches: string[] = [];
   /** Number of upcoming uploads to reject with a secondary rate limit. */
   rateLimitUploads = 0;
   /** Called before a ref update; lets a test move the branch underneath the bot. */
@@ -72,6 +74,10 @@ export class FakeRepo {
 
     let m: RegExpExecArray | null;
     if (path === "/repos/o/r/installation") return json({ id: 1 });
+    if (path === "/repos/o/r/dispatches") {
+      this.dispatches.push((body as any).event_type);
+      return new Response(null, { status: 204 });
+    }
     if (path === "/app/installations/1/access_tokens") return json({ token: "t", expires_at: new Date(Date.now() + 3600_000).toISOString() }, 201);
     if (path === "/repos/o/r/commits") return this.empty ? json({ message: "Git Repository is empty." }, 409) : json([{}]);
     if (path === "/repos/o/r/contents/README.md" && req.method === "PUT") {

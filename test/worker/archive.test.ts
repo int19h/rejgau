@@ -143,6 +143,8 @@ describe("GuildArchive", () => {
     await stub.ingest("102", batch);
     await settle("102");
     expect(rawLines(github.files("archive")).filter((l) => l.t === "MESSAGE_CREATE")).toHaveLength(1);
+    // Guild 102 has "pages": true: the Pages workflow was notified once.
+    expect(github.dispatches).toEqual(["archive-updated"]);
   });
 
   it("backfills history into the days messages were created, with members snapshotted", async () => {

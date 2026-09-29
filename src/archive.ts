@@ -38,6 +38,7 @@ const MAX_FLUSH_BYTES = 8 * 1024 * 1024;
 const REST_PAGES_PER_ALARM = 10;
 const MEDIA_MAX_ATTEMPTS = 4;
 const RELEASE_ASSET_LIMIT = 1000;
+const DISPATCH_INTERVAL_MS = 10 * 60_000;
 /** Channel types with no message history endpoint of their own (category, forum, media). */
 const NO_HISTORY_TYPES = new Set([4, 15, 16]);
 
@@ -488,6 +489,7 @@ export class GuildArchive extends DurableObject<Env> {
         const restAt = this.sql.exec<{ t: number }>(`SELECT MIN(rest_next_at) AS t FROM channels WHERE cursor IS NOT NULL AND selected = 1`).one().t;
         times.push(Math.max(now + 2000, restAt));
       }
+      if (this.get("dispatchPending") === "1") times.push(Math.max(now + 1000, Number(this.get("lastDispatchAt") ?? "0") + DISPATCH_INTERVAL_MS));
       if (this.sql.exec(`SELECT 1 FROM members WHERE done = 0 LIMIT 1`).toArray().length) {
         times.push(Math.max(now + 2000, Number(this.get("memberRetryAt") ?? "0")));
       }
@@ -518,6 +520,7 @@ export class GuildArchive extends DurableObject<Env> {
         const due = now - lastChange >= conf.cfg.flushIdleMs || now - Number(dirtySince) >= conf.cfg.flushMaxMs;
         if (due && now >= Number(this.get("retryAt") ?? "0")) await this.flush(conf.guild);
       }
+      await this.dispatchWork(conf.guild);
     } catch (e) {
       // Recorded by the step that failed; swallow so the runtime doesn't retry on top of our own schedule.
       log("alarm_error", { error: errorMessage(e) });
@@ -578,6 +581,24 @@ export class GuildArchive extends DurableObject<Env> {
       } else {
         this.sql.exec(`UPDATE channels SET cursor = ? WHERE id = ?`, batch[batch.length - 1].id, row.id);
       }
+    }
+  }
+
+  /** Tells the archive repo's Pages workflow about new commits, at most once per 10 minutes. */
+  private async dispatchWork(guild: GuildConfig): Promise<void> {
+    if (this.get("dispatchPending") !== "1") return;
+    if (!guild.pages) {
+      this.set("dispatchPending", null);
+      return;
+    }
+    const now = Date.now();
+    if (now < Number(this.get("lastDispatchAt") ?? "0") + DISPATCH_INTERVAL_MS) return;
+    this.set("lastDispatchAt", String(now)); // also paces retries after a failure
+    try {
+      await this.gh(guild).dispatch("archive-updated");
+      this.set("dispatchPending", null);
+    } catch (e) {
+      log("dispatch_error", { error: errorMessage(e) });
     }
   }
 
@@ -800,6 +821,7 @@ export class GuildArchive extends DurableObject<Env> {
       this.set("retryAt", null);
       this.set("failures", null);
       this.set("lastCommit", JSON.stringify({ sha, at: new Date().toISOString(), lines: taken }));
+      if (guild.pages) this.set("dispatchPending", "1");
       this.set("lastError", null);
       log("flush_ok", { sha, lines: taken, files: paths.length });
       return { committed: taken, sha };

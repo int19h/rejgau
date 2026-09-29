@@ -14,6 +14,8 @@ export interface GuildConfig {
   exclude: string[];
   /** Fetch each newly selected channel's full history on first sight. */
   backfill: boolean;
+  /** Send a repository_dispatch ("archive-updated") after commits, for the Pages workflow. */
+  pages: boolean;
 }
 
 export interface Config {
@@ -65,7 +67,7 @@ export function parseConfig(raw: string | undefined): Config {
     if (path.split("/").some((seg) => seg === "." || seg === "..")) throw new ConfigError(`${where}.path is invalid`);
     const channels = g.channels === "all" ? "all" : snowflakes(g.channels, `${where}.channels`);
     const exclude = g.exclude === undefined ? [] : snowflakes(g.exclude, `${where}.exclude`);
-    guilds.set(guildId, { guildId, repo: g.repo, branch, path, channels, exclude, backfill: g.backfill ?? true });
+    guilds.set(guildId, { guildId, repo: g.repo, branch, path, channels, exclude, backfill: g.backfill ?? true, pages: g.pages === true });
   }
   const num = (v: unknown, dflt: number, name: string) => {
     if (v === undefined) return dflt;

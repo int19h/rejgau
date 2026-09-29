@@ -10,7 +10,7 @@ const channels = new Map<string, ChannelInfo>([
   ch("20", 4), ch("21", 0, "20"), ch("30", 0, null, CHANNEL_FLAG_OBFUSCATED),
 ]);
 const cfg = (channels: GuildConfig["channels"], exclude: string[] = []): GuildConfig => ({
-  guildId: "1", repo: "o/r", branch: "archive", path: "", channels, exclude, backfill: true,
+  guildId: "1", repo: "o/r", branch: "archive", path: "", channels, exclude, backfill: true, pages: false,
 });
 
 describe("isArchived", () => {

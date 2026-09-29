@@ -10,7 +10,8 @@ This covers the static reader for rejgau archives, plus the build step that turn
   - Discord markdown, embeds, attachments, components, polls, stickers, reactions, replies, forwards, and app-command headers;
   - edit history and deleted-message badges.
 - **Search with Discord's syntax** (`from:`, `in:`, `has:`, `before:`, `after:`, `during:`, `mentions:`, `pinned:`, `authorType:`, `-` negation, `"phrases"`). Anything else is plain text.
-- **Static hosting only:** GitHub Pages, deployed by an Action in the archive repo. The reader also works from anywhere via `?data=<url>` pointing at CORS-enabled data.
+- **Static hosting only:** GitHub Pages, deployed by an Action in the archive repo, or any static server for a local build.
+  - There is no `?data=<url>` loading of third-party data. Pages origins (`<owner>.github.io`) are shared by all of an owner's project sites, so a rendering bug fed arbitrary input would be XSS there.
 - **Fully regenerable** from `raw/`, which is the only source of truth. The derived data is never committed to the archive branch.
 
 ## Architecture
@@ -24,14 +25,19 @@ archive repo                         rejgau repo (this one)
                                           → build data + reader → deploy to Pages
 ```
 
-The Pages workflow runs on pushes to `archive`, debounced by `concurrency` with cancel-in-progress, and also on a schedule as a safety net.
+**When the Pages workflow runs:** it lives on `main`, since workflows run from the default branch and the `github-pages` environment only deploys from there. Triggers:
+- `repository_dispatch` (`archive-updated`), sent by the bot after commits: at most once per 10 minutes, and only if the guild config has `"pages": true`;
+- an hourly `schedule`;
+- `workflow_dispatch`.
+
+The build job is debounced with `concurrency` (cancel-in-progress). The deploy job is never cancelled.
 
 - **Why the build runs in CI:**
   - The generator is a pure function from raw to site. That keeps the bot append-only, and history rewrites need no special handling: every build is a full rebuild.
   - At ~100 messages a day, a full rebuild is seconds.
-- **Private repos:** Pages on a private repo needs a paid GitHub plan, and release-asset media from a private repo only loads for signed-in viewers. For local use:
-  - `npm run build:site -- --archive <path> --out <dir>` builds the same site;
-  - `npm run serve` serves it.
+- **Pages is public.** A Pages site is publicly readable even when the repo is private, except on Enterprise Cloud with access control. Private archives should use the local build only:
+  - `npm run build:site -- --archive <path> --out <dir>`, then any static server.
+  - Media from a private repo's releases can't load in the reader, because the session cookie isn't sent cross-site, so it shows as links.
 
 ## Build step (`tools/build.ts`)
 
@@ -39,7 +45,9 @@ The Pages workflow runs on pushes to `archive`, debounced by `concurrency` with 
 
 **Order:** lines are processed in a single global order:
 1. by `at`;
-2. ties keep file order.
+2. ties keep file order (a stable sort).
+
+`gw` lines are deduplicated on (`sid`, `s`) first.
 
 This works because:
 - `rest` lines have `at` equal to their fetch time;
@@ -50,25 +58,52 @@ This works because:
 | Record | Effect on state |
 |---|---|
 | `GUILD_SNAPSHOT`, `GUILD_UPDATE`, `GUILD_ROLE_*`, `GUILD_EMOJIS_UPDATE`, `GUILD_STICKERS_UPDATE` | Update the latest guild state: name, icon, roles (for mention colours and names), emoji, stickers. |
-| `CHANNEL_SELECTED`, `CHANNEL_*`, `THREAD_*`, `THREAD_LIST_SYNC` | Update channel and thread objects, including the ancestors carried in `CHANNEL_SELECTED`. Unselected channels keep their history but are marked as such. |
-| `MESSAGE_CREATE` (`gw` or `rest`) | Create the message, or merge it into an existing one. A duplicate from replay or catch-up is recognised by ID and doesn't count as an edit. |
-| `MESSAGE_UPDATE` | Merge fields into the message. If `edited_timestamp` changed, first push the previous content, embeds, attachments and components onto `edits[]`. Unfurls and component-only updates without a new `edited_timestamp` merge silently. A LOADING-flag message becoming a real response is also a silent merge. |
-| `MESSAGE_DELETE`, `MESSAGE_DELETE_BULK` | Set `deleted_at`. The content is kept, since redaction is manual. |
-| `MESSAGE_REACTION_ADD`, `_REMOVE`, `_REMOVE_ALL`, `_REMOVE_EMOJI` | Maintain the reactor sets per emoji. For backfilled messages, the message's `reactions[]` counts are the baseline (Discord's REST history has no reactor lists). |
-| `MESSAGE_POLL_VOTE_ADD`, `_REMOVE` | Maintain voter sets per answer, falling back to `poll.results` counts. |
-| `CHANNEL_PINS_UPDATE`, `pinned` field | Track pinned state. |
-| `MEMBER_SNAPSHOT` | Fallback member info (nickname, roles, avatar) for REST messages without a `member`. |
+| `CHANNEL_SELECTED`, `CHANNEL_*`, `THREAD_*`, `THREAD_LIST_SYNC` | Update channel and thread objects, including the ancestors carried in `CHANNEL_SELECTED`. |
+| `MEMBER_SNAPSHOT` | Fallback member info (nickname, roles, avatar) for REST messages without a `member`. It's marked as "as of backfill". |
 | `MEDIA_STORED`, `MEDIA_FAILED` | Build the media index. The last record for a key wins. |
+
+**Channels that are currently unselected produce no data files:** the reader shows only selected channels. They remain in `raw/`.
+
+**Messages.** Every `MESSAGE_CREATE`/`MESSAGE_UPDATE` payload, live or REST, is a snapshot of the message:
+- Only keys present in the snapshot are merged.
+- If its `edited_timestamp` is newer than the current one, push the previous version (content, embeds, attachments, components, with its timestamp) onto `edits[]` first.
+- A snapshot with an older `edited_timestamp` is stale, and is ignored for content.
+- `edited_timestamp` never goes backwards, and `deleted_at` is never cleared.
+- Snapshots with an unchanged or null `edited_timestamp` merge silently: unfurls, a LOADING message becoming its V2 response, component updates.
+
+**Reactions** are tracked per (emoji, burst):
+- a `baseline`: the count attributable to unknown users, from the latest snapshot;
+- a `known` set of users, from live events.
+
+The rules:
+- **Displayed count** = `baseline + |known|`.
+- **ADD** puts the user in `known`.
+- **REMOVE** takes a known user out of `known`; for anyone else it does `baseline = max(0, baseline − 1)`.
+- **A new snapshot** (REST or UPDATE) whose count differs from the displayed one resets `baseline = max(0, count − |known|)`.
+- **REMOVE_ALL / REMOVE_EMOJI** clear.
+
+**Polls** follow the same scheme per answer. A snapshot with `results.is_finalized` is authoritative.
+
+**Deletes and pins:**
+- `MESSAGE_DELETE` / `_BULK` set `deleted_at`.
+- `pinned` comes from message snapshots, and from the `message_reference` of type-6 pin notices.
+- `CHANNEL_PINS_UPDATE` names no message, so it isn't used.
+
+**Threads** are linked at build time:
+- a message that started a thread gets `{thread: {id, name, count}}`;
+- a thread's first message (type 21, or the forum post whose ID equals the thread ID) gets the parent excerpt.
 
 **Output** (`site/data/`, all JSON, gzipped by Pages on the wire):
 
 ```
 data/archive.json              guild (name, icon, roles, emoji), channels tree (id, name, type, parent,
                                topic, selected), per-channel month list with counts, build time, format
-data/media.json                key → { url, type, size, w?, h? } | { error }
-data/users.json                user id → latest { username, global_name, avatar, bot, nick?, roles? }
+data/users.json                user id → { latest snapshot, names: [every username/global_name/nick seen] }
+data/search/<YYYY-MM>.json     compact search rows for all channels:
+                               [{ id, c, ts, a, text, has: [...], men: [...], pin?, del?, at: user|bot|webhook }]
 data/c/<channel>/<YYYY-MM>.json
-  { users: { <snapKey>: {id, username, global_name, avatar, nick, roles, bot, …} },
+  { media: { <key>: url | null },          only keys referenced in this file (resolved at build time)
+    users: { <snapKey>: {id, username, global_name, avatar, nick, roles, bot, …} },
     messages: [ { id, ts, type, flags, author: <snapKey>, content, edits?, deleted_at?,
                   edited_at?, attachments, embeds, components, sticker_items, poll?, votes?,
                   reactions?: [{emoji, count, users?}], reference?, referenced?: {id, author, excerpt},
@@ -81,13 +116,15 @@ data/c/<channel>/<YYYY-MM>.json
 
 **Month files are keyed by message creation month (UTC).** Threads get their own `c/<thread id>/…` files.
 
+**Media keys** are computed with the same `src/media.ts` functions the bot uses, and each month file carries only the keys it needs, so the reader never loads a global media index.
+
 **Sizes:** month files are ~0.5–1 KB per message, so ~20–40 MB/year for the main server before gzip. That is well within Pages limits, and small enough to scan for search.
 
 ## Reader (`reader/`)
 
 **Stack:** Preact + TypeScript bundled by esbuild into one JS file and one CSS file.
 - Markdown: `discord-markdown-parser` (an AST following Discord's simple-markdown rules), rendered by us.
-- Code blocks: `highlight.js` with a small set of languages, loaded lazily.
+- Code blocks: `highlight.js` core with ~15 common languages, bundled.
 - No backend.
 
 **Routes** (hash-based, so they work on Pages without rewrites):
@@ -103,7 +140,13 @@ data/c/<channel>/<YYYY-MM>.json
   - messages grouped Discord-style (same author within 7 minutes, no intervening reply or system message);
   - day separators.
 - Top: a search box. Results open in the main pane, newest first, each with channel/date context and a "jump" link.
-- Themes: dark by default, with a light theme via `prefers-color-scheme` and a toggle.
+- Themes: dark or light via `prefers-color-scheme`. There's no toggle in v1.
+
+**Security rules** (the content is untrusted):
+- Everything renders through Preact, which escapes text. The only HTML injected is highlight.js output, which escapes its input.
+- URLs (masked links, embed/author/footer URLs, link buttons, autolinks) are allowed only with `http:` or `https:`. Anything else renders as plain text.
+- Images and videos load only from archived media, via the build's media map. Discord's CDN and third-party URLs are never hotlinked: signed URLs expire, and hotlinked images act as tracking pixels. Unarchived media shows as a link.
+- A CSP meta tag: `default-src 'self'; img-src 'self' https://github.com https://*.githubusercontent.com; media-src` (same list); `style-src 'self' 'unsafe-inline'`; `script-src 'self'`.
 
 **Message rendering:**
 - **Header:**
@@ -154,9 +197,13 @@ data/c/<channel>/<YYYY-MM>.json
   - `authorType:` user, bot or webhook.
 
   Unknown keys are treated as text.
-- **Matching:** case- and diacritic-insensitive substring match over content, embed text, component text displays, attachment filenames, and forwarded content.
+- **Matching:** case- and diacritic-insensitive substring match over the current content, embed text, component text displays, attachment filenames and forwarded content. Edits are not searched.
+  - Substring matching is a deliberate superset of Discord's word matching.
+  - `from:` and `mentions:` match any name the user ever had.
+  - `before:`, `after:` and `during:` use the viewer's time zone, as Discord does. `before` and `after` exclude the named day.
+  - Deleted messages appear in results with a badge.
 - **Execution:**
-  - A Web Worker loads month files newest-first, pruned by `in:` and the date filters.
+  - The page (not a Web Worker: at this volume the scan is fast) loads `search/<YYYY-MM>.json` files newest-first, pruned by the date filters (widened by ±1 day for time zones).
   - Results stream in as they're found, capped at 500 with "load more".
   - Month files are cached in memory.
 
@@ -178,6 +225,16 @@ data/c/<channel>/<YYYY-MM>.json
 - **Build step:** unit tests over synthetic raw lines covering edits, deletes, reaction folding, replay duplicates, LOADING-then-update, unfurls, REST + MEMBER_SNAPSHOT, and a thread that is later unselected.
 - **Reader:** unit tests for the markdown renderer (Discord quirks) and the search parser and matcher.
 - **Visual check:** Playwright screenshots of the reader over the real `rejgau-test` archive, built locally.
+- **Fixtures from real data:** the backfilled-poll vote sequence, and a LOADING → V2 update.
+
+## Deferred from v1
+
+- Hover cards.
+- A month picker (prev/next only).
+- A theme toggle.
+- Lottie sticker rendering.
+- Styled `<id:customize>` links and command mentions (plain labels only).
+- Media download for private archives.
 
 ## Open questions
 

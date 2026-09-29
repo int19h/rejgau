@@ -82,7 +82,7 @@ function derLength(n: number): number[] {
   return [0x80 | out.length, ...out];
 }
 
-function der(tag: number, content: Uint8Array): Uint8Array {
+function der(tag: number, content: Uint8Array): Uint8Array<ArrayBuffer> {
   const len = derLength(content.length);
   const out = new Uint8Array(1 + len.length + content.length);
   out[0] = tag;
@@ -91,7 +91,7 @@ function der(tag: number, content: Uint8Array): Uint8Array {
   return out;
 }
 
-function concat(...parts: Uint8Array[]): Uint8Array {
+function concat(...parts: Uint8Array[]): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let i = 0;
   for (const p of parts) {
@@ -105,7 +105,7 @@ function concat(...parts: Uint8Array[]): Uint8Array {
  * DER bytes of a PKCS#8 private key from a PEM. GitHub hands out PKCS#1 ("BEGIN RSA PRIVATE KEY"),
  * which WebCrypto can't import, so it gets wrapped into PKCS#8 here.
  */
-export function pemToPkcs8(pem: string): Uint8Array {
+export function pemToPkcs8(pem: string): Uint8Array<ArrayBuffer> {
   const m = /-----BEGIN ((?:RSA )?PRIVATE KEY)-----([\s\S]+?)-----END \1-----/.exec(pem.replace(/\\n/g, "\n"));
   if (!m) throw new Error("GITHUB_APP_PRIVATE_KEY is not a PEM private key");
   const body = Uint8Array.from(atob(m[2].replace(/\s+/g, "")), (c) => c.charCodeAt(0));
@@ -278,6 +278,13 @@ export class GitHub {
       await res.body?.cancel();
     }
     this.notEmpty = true;
+  }
+
+  /** Triggers `repository_dispatch` workflows (needs contents: write). */
+  async dispatch(eventType: string): Promise<void> {
+    const res = await this.raw("POST", this.repoPath("/dispatches"), { event_type: eventType });
+    if (!res.ok) throw await failure(res, "repository_dispatch");
+    await res.body?.cancel();
   }
 
   /** SHA of the parentless commit that media release tags point at; created on first use. */
