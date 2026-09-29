@@ -41,6 +41,20 @@ const RELEASE_ASSET_LIMIT = 1000;
 /** Channel types with no message history endpoint of their own (category, forum, media). */
 const NO_HISTORY_TYPES = new Set([4, 15, 16]);
 
+/** What GuildArchive.ingest reports back to the pump. */
+export interface IngestResult {
+  /** Number of leading events that were handled (archived, skipped or dropped). */
+  handled: number;
+  /** Set when the next event failed. */
+  failed?: { retryable: boolean; error: string };
+}
+
+/** Whether retrying could help: Discord/GitHub 5xx or 429, or a network-level failure. */
+function isTransient(e: unknown): boolean {
+  if (e instanceof DiscordError || e instanceof GitHubError) return e.status >= 500 || e.status === 429 || (e instanceof GitHubError && e.retryAfterMs !== null);
+  return true; // network errors and anything unexpected: retry (the pump caps it)
+}
+
 type ChannelRow = {
   id: string;
   json: string;
@@ -52,6 +66,8 @@ type ChannelRow = {
   last_message_id: string | null;
   cursor: string | null;
   cursor_kind: string | null;
+  rest_next_at: number;
+  rest_failures: number;
 };
 
 type MediaRow = {
@@ -89,7 +105,7 @@ export class GuildArchive extends DurableObject<Env> {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS channels (
         id TEXT PRIMARY KEY, json TEXT NOT NULL, type INTEGER NOT NULL, parent_id TEXT, flags INTEGER NOT NULL DEFAULT 0,
         deleted INTEGER NOT NULL DEFAULT 0, selected INTEGER NOT NULL DEFAULT 0, last_message_id TEXT,
-        cursor TEXT, cursor_kind TEXT)`);
+        cursor TEXT, cursor_kind TEXT, rest_next_at INTEGER NOT NULL DEFAULT 0, rest_failures INTEGER NOT NULL DEFAULT 0)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS media (
         key TEXT PRIMARY KEY, url TEXT, channel_id TEXT, message_id TEXT, month TEXT NOT NULL,
         status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0)`);
@@ -250,30 +266,70 @@ export class GuildArchive extends DurableObject<Env> {
 
   // --- ingest ---
 
-  /** Called by GatewaySession with this guild's events, in order. */
-  ingest(guildId: string, events: OutboxEvent[]): Promise<void> {
+  /**
+   * Called by GatewaySession with this guild's events, in order. Never throws for a bad event:
+   * reports how many were handled and, if one failed, whether retrying could help. (Error classes
+   * don't survive RPC, so the result is the reliable channel.)
+   */
+  ingest(guildId: string, events: OutboxEvent[]): Promise<IngestResult> {
     const run = this.ingestChain.then(() => this.ingestSerial(guildId, events));
-    this.ingestChain = run.catch(() => {});
+    this.ingestChain = run.then(() => {}, () => {});
     return run;
   }
 
-  private async ingestSerial(guildId: string, events: OutboxEvent[]): Promise<void> {
+  private async ingestSerial(guildId: string, events: OutboxEvent[]): Promise<IngestResult> {
     if (!this.get("guildId")) this.set("guildId", guildId);
     const conf = this.guildConfig();
-    if (!conf) return; // guild removed from config: drop
+    if (!conf) return { handled: events.length }; // guild removed from config: drop
     const { guild } = conf;
     this.checkConfigChange(guild);
-    for (const ev of events) {
-      // Replayed after a resume or pump retry (read fresh each time: calls may have overlapped).
-      if (ev.sid === this.get("lastSid") && ev.s <= Number(this.get("lastS") ?? "-1")) continue;
-      if (!this.get("initialized") && ev.t !== "GUILD_CREATE" && !ev.t.startsWith("SESSION_")) {
-        await this.bootstrap(guild, guildId);
+    let handled = 0;
+    try {
+      for (const ev of events) {
+        const marker = ev.t.startsWith("SESSION_");
+        // Replayed after a resume or pump retry (read fresh each time: calls may have overlapped).
+        if (!marker && ev.sid === this.get("lastSid") && ev.s <= Number(this.get("lastS") ?? "-1")) {
+          handled++;
+          continue;
+        }
+        if (!this.get("initialized") && ev.t !== "GUILD_CREATE" && !marker && !(await this.tryBootstrap(guild, guildId))) {
+          handled++; // can't know the channel tree: fail closed and drop the event
+          continue;
+        }
+        await this.handle(guild, ev);
+        if (!marker) {
+          this.set("lastSid", ev.sid);
+          this.set("lastS", String(ev.s));
+        }
+        handled++;
       }
-      await this.handle(guild, ev);
-      this.set("lastSid", ev.sid);
-      this.set("lastS", String(ev.s));
+    } catch (e) {
+      log("ingest_error", { handled, error: errorMessage(e) });
+      return { handled, failed: { retryable: isTransient(e), error: errorMessage(e).slice(0, 500) } };
+    } finally {
+      await this.scheduleAlarm();
     }
-    await this.scheduleAlarm();
+    return { handled };
+  }
+
+  /**
+   * Bootstraps unless it recently failed for good (e.g. the bot is no longer in the guild), which
+   * is recorded in /status. Returns whether the channel tree is now known. Transient errors throw.
+   */
+  private async tryBootstrap(guild: GuildConfig, guildId: string): Promise<boolean> {
+    const failedAt = Number(this.get("bootstrapFailedAt") ?? "0");
+    if (Date.now() - failedAt < 10 * 60_000) return false;
+    try {
+      await this.bootstrap(guild, guildId);
+      this.set("bootstrapError", null);
+      this.set("bootstrapFailedAt", null);
+      return true;
+    } catch (e) {
+      if (isTransient(e)) throw e;
+      this.set("bootstrapError", errorMessage(e).slice(0, 300));
+      this.set("bootstrapFailedAt", String(Date.now()));
+      return false;
+    }
   }
 
   /** Records config changes that affect this guild and reconciles channel selection. */
@@ -422,7 +478,8 @@ export class GuildArchive extends DurableObject<Env> {
     }
     if (!paused) {
       if (this.sql.exec(`SELECT 1 FROM channels WHERE cursor IS NOT NULL AND selected = 1 LIMIT 1`).toArray().length) {
-        times.push(Math.max(now + 2000, Number(this.get("restRetryAt") ?? "0")));
+        const restAt = this.sql.exec<{ t: number }>(`SELECT MIN(rest_next_at) AS t FROM channels WHERE cursor IS NOT NULL AND selected = 1`).one().t;
+        times.push(Math.max(now + 2000, restAt));
       }
       const media = this.sql.exec<{ t: number | null }>(`SELECT MIN(next_at) AS t FROM media WHERE status = 'pending'`).one().t;
       if (media !== null) {
@@ -461,31 +518,32 @@ export class GuildArchive extends DurableObject<Env> {
 
   /** Pages through REST history for channels with a cursor (backfill or catch-up). */
   private async restWork(guild: GuildConfig): Promise<void> {
-    if (Date.now() < Number(this.get("restRetryAt") ?? "0")) return;
     let pages = 0;
     while (pages < REST_PAGES_PER_ALARM) {
-      const row = this.sql.exec<ChannelRow>(`SELECT * FROM channels WHERE cursor IS NOT NULL AND selected = 1 LIMIT 1`).toArray()[0];
+      const row = this.sql
+        .exec<ChannelRow>(`SELECT * FROM channels WHERE cursor IS NOT NULL AND selected = 1 AND rest_next_at <= ? ORDER BY rest_next_at LIMIT 1`, Date.now())
+        .toArray()[0];
       if (!row) return;
       pages++;
       let batch: Record<string, any>[];
       try {
         batch = await discordGet<Record<string, any>[]>(this.env.DISCORD_TOKEN, `/channels/${row.id}/messages?limit=100&after=${row.cursor}`);
       } catch (e) {
-        const status = e instanceof DiscordError ? e.status : 0;
-        if (status === 403 || status === 404) {
-          // No access: final for this channel. Retrying would only add to Discord's invalid-request count.
-          this.synthetic(guild, row.cursor_kind === "catchup" ? "CATCHUP_END" : "BACKFILL_END", { channel_id: row.id, error: status });
-          this.sql.exec(`UPDATE channels SET cursor = NULL, cursor_kind = NULL WHERE id = ?`, row.id);
+        if (!isTransient(e)) {
+          // No access, wrong channel type, …: final for this channel. Retrying would only add to
+          // Discord's invalid-request count.
+          const status = e instanceof DiscordError ? e.status : undefined;
+          this.synthetic(guild, row.cursor_kind === "catchup" ? "CATCHUP_END" : "BACKFILL_END", { channel_id: row.id, error: status ?? errorMessage(e).slice(0, 200) });
+          this.sql.exec(`UPDATE channels SET cursor = NULL, cursor_kind = NULL, rest_failures = 0 WHERE id = ?`, row.id);
           continue;
         }
-        // Transient (5xx, network, persistent 429): keep the cursor and back off.
-        const failures = Number(this.get("restFailures") ?? "0") + 1;
-        this.set("restFailures", String(failures));
-        this.set("restRetryAt", String(Date.now() + Math.min(30 * 60_000, 30_000 * 2 ** (failures - 1))));
+        // Transient (5xx, 429, network): back off this channel only; others proceed.
+        const failures = row.rest_failures + 1;
+        this.sql.exec(`UPDATE channels SET rest_failures = ?, rest_next_at = ? WHERE id = ?`, failures, Date.now() + Math.min(30 * 60_000, 30_000 * 2 ** (failures - 1)), row.id);
         log("rest_error", { failures, error: errorMessage(e) });
-        return;
+        continue;
       }
-      this.set("restFailures", null);
+      if (row.rest_failures) this.sql.exec(`UPDATE channels SET rest_failures = 0 WHERE id = ?`, row.id);
       // The channel may have been unselected while we waited.
       if (!this.isSelected(row.id) || this.channelRow(row.id)?.cursor !== row.cursor) continue;
       batch.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
@@ -732,6 +790,7 @@ export class GuildArchive extends DurableObject<Env> {
       lastError: JSON.parse(this.get("lastError") ?? "null"),
       retryAt: this.get("retryAt") ? new Date(Number(this.get("retryAt"))).toISOString() : null,
       githubBackoffUntil: this.get("githubBackoffUntil") ? new Date(Number(this.get("githubBackoffUntil"))).toISOString() : null,
+      bootstrapError: this.get("bootstrapError"),
     };
   }
 
@@ -777,6 +836,7 @@ export interface GuildStatus {
   lastError: { at: string; error: string; status?: number } | null;
   retryAt: string | null;
   githubBackoffUntil: string | null;
+  bootstrapError: string | null;
 }
 
 function toInfo(r: ChannelRow): ChannelInfo {

@@ -12,6 +12,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { parseConfig, type Config } from "./config";
+import type { IngestResult } from "./archive";
 import type { Env, OutboxEvent } from "./env";
 import { errorMessage, log } from "./util";
 
@@ -28,8 +29,11 @@ const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const GUILD_ID_IN_ID = new Set(["GUILD_CREATE", "GUILD_UPDATE", "GUILD_DELETE"]);
 
 const PUMP_BATCH = 100;
-/** After this many consecutive failures, the outbox head is set aside so other events can flow. */
-const PUMP_MAX_FAILURES = 10;
+/**
+ * An event that fails permanently is set aside at once. One that keeps failing "transiently" is set
+ * aside only after this many attempts (~8 h at the 5 min backoff cap), in case it's really a bug.
+ */
+const PUMP_MAX_FAILURES = 100;
 /** Discord resets the token after 1000 IDENTIFYs a day; stay far below that even in a crash loop. */
 const IDENTIFY_BUDGET_PER_DAY = 50;
 
@@ -204,13 +208,13 @@ export class GatewaySession extends DurableObject<Env> {
         this.drop(ws, "invalid session");
         return;
       case 0:
-        this.onDispatch(msg.t!, msg.s ?? -1, msg.d);
+        this.onDispatch(msg.t!, msg.s, msg.d);
         return;
     }
   }
 
   /** Synchronous by design: the outbox write and the seq update must not be separated by an await. */
-  private onDispatch(t: string, s: number, d: any): void {
+  private onDispatch(t: string, s: number | null, d: any): void {
     const cfg = this.config();
     const at = Date.now();
     if (t === "READY" || t === "RESUMED") this.set("connectFailures", null);
@@ -222,8 +226,10 @@ export class GatewaySession extends DurableObject<Env> {
       this.bump("resumes");
     }
     const sid = this.get("sessionId") ?? "";
+    // Dispatches always carry a sequence number; be defensive and never let a missing one clobber `seq`.
+    const seq = typeof s === "number" ? s : Number(this.get("seq") ?? "0");
     const enqueue = (guild: string, type: string, payload: string) =>
-      this.sql.exec(`INSERT INTO outbox (guild, sid, s, t, d, at) VALUES (?, ?, ?, ?, ?, ?)`, guild, sid, s, type, payload, at);
+      this.sql.exec(`INSERT INTO outbox (guild, sid, s, t, d, at) VALUES (?, ?, ?, ?, ?, ?)`, guild, sid, seq, type, payload, at);
 
     if (t === "READY" || t === "RESUMED") {
       // Never forward READY itself (it lists every guild the bot is in); tell each guild instead.
@@ -233,7 +239,7 @@ export class GatewaySession extends DurableObject<Env> {
       const guild: string | undefined = GUILD_ID_IN_ID.has(t) ? d?.id : d?.guild_id;
       if (guild && cfg?.guilds.has(guild)) enqueue(guild, t, JSON.stringify(d));
     }
-    this.set("seq", String(s));
+    if (typeof s === "number") this.set("seq", String(s));
     this.kickPump();
   }
 
@@ -262,19 +268,26 @@ export class GatewaySession extends DurableObject<Env> {
           run.push(r);
         }
         const events: OutboxEvent[] = run.map(({ sid, s, t, d, at }) => ({ sid, s, t, d, at }));
+        let result: IngestResult;
         try {
-          await this.env.GUILD.get(this.env.GUILD.idFromName(head.guild)).ingest(head.guild, events);
+          result = await this.env.GUILD.get(this.env.GUILD.idFromName(head.guild)).ingest(head.guild, events);
         } catch (e) {
-          const error = errorMessage(e);
-          this.set("lastPumpError", error);
-          log("pump_error", { error });
-          const first = run[0].n;
-          this.pumpFailures = this.pumpFailures.n === first ? { n: first, count: this.pumpFailures.count + 1 } : { n: first, count: 1 };
-          if (this.pumpFailures.count >= PUMP_MAX_FAILURES) {
-            // Set the head event aside (visible in /status) so one bad event can't stall everything.
-            this.sql.exec(`INSERT OR REPLACE INTO dead SELECT *, ? FROM outbox WHERE n = ?`, error.slice(0, 500), first);
-            this.sql.exec(`DELETE FROM outbox WHERE n = ?`, first);
-            log("pump_dead_letter", { n: first });
+          result = { handled: 0, failed: { retryable: true, error: errorMessage(e) } }; // RPC/DO failure
+        }
+        if (result.handled > 0) {
+          this.sql.exec(`DELETE FROM outbox WHERE n <= ? AND guild = ?`, run[result.handled - 1].n, head.guild);
+        }
+        if (result.failed) {
+          const failing = run[result.handled];
+          this.set("lastPumpError", result.failed.error);
+          log("pump_error", { n: failing.n, retryable: result.failed.retryable, error: result.failed.error });
+          this.pumpFailures = this.pumpFailures.n === failing.n ? { n: failing.n, count: this.pumpFailures.count + 1 } : { n: failing.n, count: 1 };
+          if (!result.failed.retryable || this.pumpFailures.count >= PUMP_MAX_FAILURES) {
+            // Set the failing event aside (visible in /status) so it can't stall everything.
+            this.sql.exec(`INSERT OR REPLACE INTO dead SELECT *, ? FROM outbox WHERE n = ?`, result.failed.error, failing.n);
+            this.sql.exec(`DELETE FROM outbox WHERE n = ?`, failing.n);
+            log("pump_dead_letter", { n: failing.n });
+            this.pumpFailures = { n: -1, count: 0 };
             continue;
           }
           if (!this.pumpRetry) {
@@ -286,7 +299,6 @@ export class GatewaySession extends DurableObject<Env> {
           return;
         }
         this.pumpFailures = { n: -1, count: 0 };
-        this.sql.exec(`DELETE FROM outbox WHERE n <= ? AND guild = ?`, run[run.length - 1].n, head.guild);
       }
     } finally {
       this.pumping = false;

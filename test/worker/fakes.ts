@@ -179,10 +179,14 @@ export class FakeDiscord {
   /** guild ID → GUILD_CREATE-shaped object, served by the /guilds REST endpoints. */
   guilds = new Map<string, Record<string, any>>();
   requests: string[] = [];
+  /** Request paths (without query) that answer with this status instead. */
+  failures = new Map<string, number>();
 
   handle(req: Request): Response {
     const url = new URL(req.url);
     this.requests.push(`${url.pathname}${url.search}`);
+    const forced = this.failures.get(url.pathname);
+    if (forced) return json({ message: "forced failure" }, forced);
     if (url.hostname === "cdn.discordapp.com") {
       const bytes = new Uint8Array(10);
       if (url.pathname.includes("nolength")) {

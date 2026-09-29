@@ -126,3 +126,30 @@ describe("media edge cases", () => {
     expect(github.repo("r108").releases.flatMap((r) => r.assets)).toEqual([]);
   });
 });
+
+describe("failure classification", () => {
+  it("reports a transient failure with how far it got, and succeeds on retry", async () => {
+    discord.channels.set("33", { id: "33", type: 11, name: "thread-flaky", parent_id: "11" });
+    discord.failures.set("/api/v10/channels/33", 503);
+    const batch = events("s9", [
+      ["MESSAGE_CREATE", message("1554541602075316500", "11", "before flaky", { guild_id: "109" })],
+      ["MESSAGE_CREATE", message("1554541602075316501", "33", "in flaky thread", { guild_id: "109" })],
+    ], 80);
+    const first = await stub("109").ingest("109", batch);
+    expect(first).toMatchObject({ handled: 1, failed: { retryable: true } });
+    discord.failures.delete("/api/v10/channels/33");
+    // The pump resends from the failing event.
+    expect(await stub("109").ingest("109", batch.slice(first.handled))).toEqual({ handled: 1 });
+    await settle("109");
+    expect(committed("109")).toContain("in flaky thread");
+    expect(committed("109").match(/before flaky/g)).toHaveLength(1);
+  });
+
+  it("drops events (fail closed) and reports why when bootstrap is refused for good", async () => {
+    discord.failures.set("/api/v10/guilds/102", 403);
+    const result = await stub("102").ingest("102", events("s9", [["MESSAGE_CREATE", message("1554541602075316600", "11", "unknowable", { guild_id: "102" })]], 90));
+    expect(result).toEqual({ handled: 1 });
+    expect((await stub("102").status()).bootstrapError).toMatch(/403/);
+    discord.failures.delete("/api/v10/guilds/102");
+  });
+});
