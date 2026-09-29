@@ -54,6 +54,12 @@ export default {
         if (!post) break;
         await gateway(env).stop();
         return json({ ok: true });
+      case "/reset": {
+        // Destructive: requires naming the guild explicitly.
+        if (!post || !guildId) return json({ error: "POST /reset?guild=<id> required" }, 400);
+        await archive(guildId).reset().catch(() => {}); // the object aborts itself after wiping
+        return json({ reset: guildId });
+      }
       case "/retry-media": {
         if (!post) break;
         const out: Record<string, unknown> = {};
@@ -76,7 +82,7 @@ export default {
         return json(out);
       }
     }
-    return json({ error: "unknown route", routes: ["GET /status", "POST /start", "POST /stop", "POST /flush", "POST /pause", "POST /resume", "POST /retry-media"] }, 404);
+    return json({ error: "unknown route", routes: ["GET /status", "POST /start", "POST /stop", "POST /flush", "POST /pause", "POST /resume", "POST /retry-media", "POST /reset?guild=ID"] }, 404);
   },
 
   async scheduled(_controller, env): Promise<void> {

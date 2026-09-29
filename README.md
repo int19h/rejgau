@@ -19,7 +19,7 @@ Each line is `{"at", "src", ["sid", "s"], "t", "d"}`:
 
 | `src` | Meaning |
 |---|---|
-| `gw` | A Gateway dispatch, `d` verbatim. `sid`/`s` are the session ID and sequence number. Filed under the day it was received. |
+| `gw` | A Gateway dispatch: `d` as received, minus non-public fields (see [Privacy filtering](#privacy-filtering)). `sid` is an opaque stand-in for the session ID, and `s` is the sequence number. Filed under the day it was received. |
 | `rest` | A message fetched over REST during backfill or catch-up. `t` is `MESSAGE_CREATE`. Filed under the day the message was *created*; `at` is when it was fetched. |
 | `rejgau` | A synthetic record (see below). |
 
@@ -32,6 +32,7 @@ The synthetic records are:
 | `GUILD_SNAPSHOT` | Guild metadata (name, icon, roles, emoji, stickers). Built from an allowlist of fields, so it never includes channel lists or members. |
 | `CHANNEL_SELECTED`, `CHANNEL_UNSELECTED` | A channel or thread started or stopped being archived. `CHANNEL_SELECTED` includes the channel object and its parent/category objects. |
 | `BACKFILL_END`, `CATCHUP_BEGIN`, `CATCHUP_END` | History fetched over REST. Catch-up after a lost session recovers new messages only, not edits, deletes or reactions made while disconnected. |
+| `MEMBER_SNAPSHOT` | `{user_id, member}` for each author of backfilled messages, because REST history has no nicknames or roles. The values are as of backfill time; `member` is null if the person left the server. |
 | `MEDIA_STORED`, `MEDIA_FAILED` | A media item was uploaded, or couldn't be. `MEDIA_STORED` includes `key`, `release`, `url`, `size` and `content_type`. |
 
 **Delivery is at-least-once.** A message can appear more than once: replays after a crash, or catch-up overlapping live events. Consumers dedupe by message ID.
@@ -41,6 +42,33 @@ The synthetic records are:
 **Nothing about unselected channels is written.** That includes their names, their events, and threads under them. Two exceptions:
 - Forwarded messages carry the forwarded content wherever they are posted.
 - A parent channel's "thread created" system message shows the thread's name even if that thread is excluded.
+
+## Privacy filtering
+
+Every logged payload goes through `src/sanitize.ts`. The rule: keep what any member of the channel can see in the Discord client, and drop everything else. What stays:
+- content, attachments, embeds and components;
+- names, avatars, badges and profile cosmetics;
+- nicknames, roles and join dates;
+- reactions and who reacted, and poll votes and who voted.
+
+These fields are removed wherever they appear:
+
+| Removed | Why |
+|---|---|
+| member `communication_disabled_until`, `mute`, `deaf`, `pending`, `flags`, `unusual_dm_activity_until` | Moderation state: timeouts, voice mute/deafen, membership screening, rejoin/verification/quarantine flags. |
+| user `flags` (`public_flags` is kept) | Includes private account flags. |
+| `permission_overwrites`, `permissions` | Security configuration. Overwrites also list who has explicit access to private channels. |
+| `content_scan_metadata`, `content_scan_version` | Discord's safety-scanner verdicts on attachments and embeds. |
+| component `custom_id` | Opaque app state, which may embed user IDs or signed tokens. |
+| `party_id` | Rich-presence invite join secret. |
+| emoji and sticker `user` | Who uploaded them, which only server managers can see. |
+| `nonce`, `me`, `me_burst`, `burst_me`, `me_voted`, `vad_colors` | Client-internal, or the bot's own point of view. |
+
+Also:
+- Real Gateway session IDs are never published.
+- `CONFIG` records say only how many channels are excluded, not which ones.
+- Guild snapshots are built from an allowlist of fields (no channel lists, members, or AFK/system/rules channel IDs).
+- Nothing about unselected channels is logged.
 
 ## Setup
 
@@ -139,6 +167,7 @@ Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized reques
 | `POST /start`, `POST /stop` | Start the Gateway session (also clears a fatal error, e.g. after fixing the token), or stop it. |
 | `POST /flush[?guild=ID]` | Commit everything buffered now. |
 | `POST /pause[?guild=ID]`, `POST /resume[?guild=ID]` | Stop or restart committing. Events keep being buffered meanwhile. |
+| `POST /reset?guild=ID` | Wipe the bot's state for a guild, so the next event bootstraps and backfills again. For test setups: delete the archive branch first, or the backfill appends duplicates. |
 | `POST /retry-media[?guild=ID]` | Re-queue media recorded as failed, e.g. after fixing the GitHub setup. When a key has several `MEDIA_*` records, the last one wins. |
 
 ## Removing messages from the archive

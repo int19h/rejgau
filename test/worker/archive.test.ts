@@ -2,6 +2,7 @@ import { abortAllDurableObjects, runDurableObjectAlarm } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { OutboxEvent } from "../../src/env";
+import { publicSessionId } from "../../src/sanitize";
 import { installFakes, type FakeDiscord, type FakeGitHub, type FakeRepo } from "./fakes";
 
 // Config (see vitest.config.ts): channels ["10"] (a category), exclude ["13"]; backfill off for 101.
@@ -61,7 +62,7 @@ async function settle(guildId: string): Promise<void> {
     await runDurableObjectAlarm(stub);
     const st = await stub.status();
     if (st.lastError) throw new Error(`flush failed: ${st.lastError.error}`);
-    if (!st.pendingLines && !st.mediaPending && !st.restCursors) return;
+    if (!st.pendingLines && !st.mediaPending && !st.restCursors && !st.membersPending) return;
     await new Promise((r) => setTimeout(r, 5));
   }
   throw new Error("archive did not settle");
@@ -115,7 +116,8 @@ describe("GuildArchive", () => {
     expect(selected.channel.id).toBe("11");
     expect(selected.ancestors).toMatchObject([CATEGORY]);
     const msg = lines.find((l) => l.t === "MESSAGE_CREATE");
-    expect(msg).toMatchObject({ src: "gw", sid: "s1", s: 3, d: { content: "hello <:e:55>" } });
+    expect(msg).toMatchObject({ src: "gw", sid: publicSessionId("s1"), s: 3, d: { content: "hello <:e:55>" } });
+    expect(all).not.toContain('"s1"'); // real session IDs are never published
     expect(types).toContain("MESSAGE_REACTION_ADD");
 
     // Media: attachment, avatar and both emoji, in a release tagged on the media-root commit.
@@ -143,9 +145,14 @@ describe("GuildArchive", () => {
     expect(rawLines(github.files("archive")).filter((l) => l.t === "MESSAGE_CREATE")).toHaveLength(1);
   });
 
-  it("backfills history into the days messages were created", async () => {
+  it("backfills history into the days messages were created, with members snapshotted", async () => {
     useGuild("103");
-    discord.messages.set("11", [message(OLD_MSG_ID, "11", "old news")]);
+    discord.messages.set("11", [message(OLD_MSG_ID, "11", "old news"), message(String(BigInt(OLD_MSG_ID) + 1n), "11", "from someone who left", { author: { id: "8", username: "gone" } })]);
+    discord.members.set("7", {
+      user: { id: "7", username: "u", discriminator: "0", flags: 123 },
+      nick: "Nick", roles: ["5"], joined_at: "2024-01-01T00:00:00Z", premium_since: null, avatar: null,
+      communication_disabled_until: "2030-01-01T00:00:00Z", mute: true, deaf: false, flags: 2, unusual_dm_activity_until: "x",
+    });
     const stub = env.GUILD.get(env.GUILD.idFromName("103"));
     await stub.ingest("103", events("s1", [["GUILD_CREATE", guildCreate("103")]]));
     await settle("103");
@@ -154,6 +161,11 @@ describe("GuildArchive", () => {
     const lines = rawLines(files);
     expect(lines.find((l) => l.src === "rest")).toMatchObject({ t: "MESSAGE_CREATE", d: { id: OLD_MSG_ID } });
     expect(lines.some((l) => l.t === "BACKFILL_END" && l.d.channel_id === "11")).toBe(true);
+    const snaps = Object.fromEntries(lines.filter((l) => l.t === "MEMBER_SNAPSHOT").map((l) => [l.d.user_id, l.d.member]));
+    expect(snaps).toEqual({
+      "7": { user: { id: "7", username: "u", discriminator: "0" }, nick: "Nick", roles: ["5"], joined_at: "2024-01-01T00:00:00Z", premium_since: null, avatar: null },
+      "8": null,
+    });
   });
 
   it("catches up after a new session", async () => {

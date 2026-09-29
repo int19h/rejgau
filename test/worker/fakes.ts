@@ -178,6 +178,8 @@ export class FakeDiscord {
   channels = new Map<string, Record<string, any>>();
   /** guild ID → GUILD_CREATE-shaped object, served by the /guilds REST endpoints. */
   guilds = new Map<string, Record<string, any>>();
+  /** user ID → guild member object, served by GET /guilds/{id}/members/{user}. */
+  members = new Map<string, Record<string, any>>();
   requests: string[] = [];
   /** Request paths (without query) that answer with this status instead. */
   failures = new Map<string, number>();
@@ -206,6 +208,10 @@ export class FakeDiscord {
       const newer = (this.messages.get(m[1]) ?? []).filter((msg) => BigInt(msg.id) > after).sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
       // Discord returns the `limit` messages right after `after`, newest first.
       return json(newer.slice(0, limit).reverse());
+    }
+    if ((m = /^\/api\/v10\/guilds\/(\d+)\/members\/(\d+)$/.exec(url.pathname))) {
+      const member = this.members.get(m[2]);
+      return member ? json(member) : json({ message: "Unknown Member", code: 10007 }, 404);
     }
     if ((m = /^\/api\/v10\/guilds\/(\d+)(\/channels|\/threads\/active)?$/.exec(url.pathname))) {
       const g = this.guilds.get(m[1]);

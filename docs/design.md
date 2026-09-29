@@ -115,6 +115,10 @@ Everything below lives under a configurable folder on the `archive` branch. All 
 - Live events only append to the current day's file. Backfill appends to past days' files.
 - At ~100 messages a day, a day file is ~200–400 KB, and ~100 MB a year uncompressed. Git's delta compression makes the repository much smaller than that.
 
+### Privacy filtering
+
+All logged payloads pass through `src/sanitize.ts`. It keeps what channel members can see in the client and drops moderation state, security configuration, safety-scanner output, app-internal IDs and bot-perspective fields. The README lists each field and why. "Verbatim" in this document means verbatim minus those fields.
+
 ### Derived view (regenerable)
 
 - A late edit, reaction or delete to an old message changes that message's *month* file. The reader therefore never has to replay events.

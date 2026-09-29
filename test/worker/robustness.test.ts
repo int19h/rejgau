@@ -28,7 +28,7 @@ async function settle(g: string): Promise<void> {
     await runDurableObjectAlarm(stub(g));
     const st = await stub(g).status();
     if (st.lastError) throw new Error(`flush failed: ${st.lastError.error}`);
-    if (!st.pendingLines && !st.mediaPending && !st.restCursors) return;
+    if (!st.pendingLines && !st.mediaPending && !st.restCursors && !st.membersPending) return;
   }
   throw new Error("archive did not settle");
 }

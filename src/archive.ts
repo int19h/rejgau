@@ -16,14 +16,14 @@ import { discordGet, DiscordError } from "./discord";
 import type { Env, OutboxEvent } from "./env";
 import { ConflictError, GitHub, GitHubAuthError, GitHubError } from "./github";
 import { emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "./media";
+import { MEMBER_FIELDS, publicSessionId, sanitize } from "./sanitize";
 import { dayPath, errorMessage, joinPath, log, maxSnowflake, monthTag, rawLine, snowflakeTime } from "./util";
 
 /** Fields of GUILD_CREATE/GUILD_UPDATE worth keeping. An allowlist, so that new Discord fields
  * (and channel-bearing ones like stage_instances or guild_scheduled_events) never leak by default. */
 const GUILD_FIELDS = [
   "id", "name", "icon", "banner", "splash", "description", "features", "owner_id", "vanity_url_code",
-  "preferred_locale", "premium_tier", "roles", "emojis", "stickers", "nsfw_level", "system_channel_id",
-  "rules_channel_id", "afk_channel_id",
+  "preferred_locale", "premium_tier", "roles", "emojis", "stickers", "nsfw_level",
 ];
 
 /** Events that concern the guild as a whole and are always archived. */
@@ -109,6 +109,8 @@ export class GuildArchive extends DurableObject<Env> {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS media (
         key TEXT PRIMARY KEY, url TEXT, channel_id TEXT, message_id TEXT, month TEXT NOT NULL,
         status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0)`);
+      // Authors of backfilled messages whose server membership still needs a MEMBER_SNAPSHOT.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS members (user_id TEXT PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0)`);
       for (const r of this.sql.exec<ChannelRow>(`SELECT * FROM channels`)) this.channels.set(r.id, toInfo(r));
     });
   }
@@ -145,7 +147,11 @@ export class GuildArchive extends DurableObject<Env> {
   /** Buffers one raw log line, filed under the day of `fileAt` (default: `at`). */
   private emit(guild: GuildConfig, line: { at: number; src: string; sid?: string; s?: number; t: string }, dJson: string, fileAt = line.at): void {
     const path = joinPath(guild.path, `raw/${dayPath(fileAt)}.jsonl`);
-    this.sql.exec(`INSERT INTO pending (path, line, at) VALUES (?, ?, ?)`, path, rawLine(line, dJson), Date.now());
+    // Every line passes through the privacy filter (see sanitize.ts), and session IDs are replaced
+    // by an opaque stand-in.
+    const publicLine = { ...line, sid: line.sid === undefined ? undefined : publicSessionId(line.sid) };
+    const d = JSON.stringify(sanitize(JSON.parse(dJson)));
+    this.sql.exec(`INSERT INTO pending (path, line, at) VALUES (?, ?, ?)`, path, rawLine(publicLine, d), Date.now());
     if (!this.get("dirtySince")) this.set("dirtySince", String(Date.now()));
     this.set("lastChangeAt", String(Date.now()));
   }
@@ -337,7 +343,8 @@ export class GuildArchive extends DurableObject<Env> {
     const sig = JSON.stringify({ repo: guild.repo, branch: guild.branch, path: guild.path, channels: guild.channels, exclude: guild.exclude, backfill: guild.backfill });
     if (sig === this.get("configSig")) return;
     this.set("configSig", sig);
-    this.synthetic(guild, "CONFIG", { channels: guild.channels, exclude: guild.exclude, backfill: guild.backfill });
+    // Excluded channel IDs are left out: they'd only reveal channels that aren't archived.
+    this.synthetic(guild, "CONFIG", { channels: guild.channels, excluded: guild.exclude.length, backfill: guild.backfill });
     if (this.get("initialized")) this.reconcile(guild);
   }
 
@@ -347,7 +354,7 @@ export class GuildArchive extends DurableObject<Env> {
     switch (ev.t) {
       case "SESSION_START":
       case "SESSION_RESUMED":
-        this.emit(guild, { at: ev.at, src: "rejgau", t: ev.t }, ev.d);
+        this.emit(guild, { at: ev.at, src: "rejgau", t: ev.t }, JSON.stringify({ session_id: publicSessionId(ev.sid) }));
         return;
 
       case "GUILD_CREATE":
@@ -481,6 +488,9 @@ export class GuildArchive extends DurableObject<Env> {
         const restAt = this.sql.exec<{ t: number }>(`SELECT MIN(rest_next_at) AS t FROM channels WHERE cursor IS NOT NULL AND selected = 1`).one().t;
         times.push(Math.max(now + 2000, restAt));
       }
+      if (this.sql.exec(`SELECT 1 FROM members WHERE done = 0 LIMIT 1`).toArray().length) {
+        times.push(Math.max(now + 2000, Number(this.get("memberRetryAt") ?? "0")));
+      }
       const media = this.sql.exec<{ t: number | null }>(`SELECT MIN(next_at) AS t FROM media WHERE status = 'pending'`).one().t;
       if (media !== null) {
         const paced = Number(this.get("lastUploadAt") ?? "0") + conf.cfg.mediaSpacingMs;
@@ -499,6 +509,7 @@ export class GuildArchive extends DurableObject<Env> {
     this.busy = true;
     try {
       await this.restWork(conf.guild);
+      await this.memberWork(conf.guild);
       await this.mediaWork(conf.cfg, conf.guild);
       const dirtySince = this.get("dirtySince");
       if (dirtySince) {
@@ -554,6 +565,8 @@ export class GuildArchive extends DurableObject<Env> {
         this.emit(guild, { at: now, src: "rest", t: "MESSAGE_CREATE" }, JSON.stringify(m), created);
         this.enqueueMedia(mediaInMessage(m, guildId), monthTag(created));
         this.noteMessage(row.id, m.id);
+        // REST messages carry no `member` (nickname, roles): snapshot each author's membership once.
+        if (m.author?.id && !m.webhook_id) this.sql.exec(`INSERT OR IGNORE INTO members (user_id) VALUES (?)`, m.author.id);
       }
       if (batch.length < 100) {
         this.synthetic(guild, row.cursor_kind === "catchup" ? "CATCHUP_END" : "BACKFILL_END", {
@@ -565,6 +578,30 @@ export class GuildArchive extends DurableObject<Env> {
       } else {
         this.sql.exec(`UPDATE channels SET cursor = ? WHERE id = ?`, batch[batch.length - 1].id, row.id);
       }
+    }
+  }
+
+  /**
+   * Logs the current server membership of backfilled authors as MEMBER_SNAPSHOT records (the
+   * values at backfill time; Discord keeps no history). `member` is null for people who left.
+   */
+  private async memberWork(guild: GuildConfig): Promise<void> {
+    const guildId = this.get("guildId")!;
+    if (Date.now() < Number(this.get("memberRetryAt") ?? "0")) return;
+    const rows = this.sql.exec<{ user_id: string }>(`SELECT user_id FROM members WHERE done = 0 LIMIT 20`).toArray();
+    for (const { user_id } of rows) {
+      let member: Record<string, unknown> | null;
+      try {
+        member = pick(await discordGet<Record<string, any>>(this.env.DISCORD_TOKEN, `/guilds/${guildId}/members/${user_id}`), MEMBER_FIELDS);
+      } catch (e) {
+        if (isTransient(e)) {
+          this.set("memberRetryAt", String(Date.now() + 60_000)); // try again later
+          return;
+        }
+        member = null; // 404 Unknown Member: no longer in the server
+      }
+      this.synthetic(guild, "MEMBER_SNAPSHOT", { user_id, member });
+      this.sql.exec(`UPDATE members SET done = 1 WHERE user_id = ?`, user_id);
     }
   }
 
@@ -787,6 +824,7 @@ export class GuildArchive extends DurableObject<Env> {
       selectedChannels: count(`SELECT COUNT(*) AS c FROM channels WHERE selected = 1 AND deleted = 0`),
       restCursors: count(`SELECT COUNT(*) AS c FROM channels WHERE cursor IS NOT NULL AND selected = 1`),
       mediaPending: count(`SELECT COUNT(*) AS c FROM media WHERE status = 'pending'`),
+      membersPending: count(`SELECT COUNT(*) AS c FROM members WHERE done = 0`),
       mediaDone: count(`SELECT COUNT(*) AS c FROM media WHERE status = 'done'`),
       mediaFailed: count(`SELECT COUNT(*) AS c FROM media WHERE status = 'failed'`),
       lastCommit: JSON.parse(this.get("lastCommit") ?? "null"),
@@ -820,6 +858,16 @@ export class GuildArchive extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Forgets everything about this guild (buffer, channel state, cursors, media queue), so the next
+   * event bootstraps and backfills from scratch. For test setups; already-uploaded media is reused.
+   */
+  async reset(): Promise<void> {
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    this.ctx.abort("reset"); // restart with fresh tables
+  }
+
   /** Puts failed media back in the queue (e.g. after fixing the GitHub setup). */
   async retryFailedMedia(): Promise<{ requeued: number }> {
     const n = this.sql.exec<{ c: number }>(`SELECT COUNT(*) AS c FROM media WHERE status = 'failed'`).one().c;
@@ -842,6 +890,7 @@ export interface GuildStatus {
   selectedChannels: number;
   restCursors: number;
   mediaPending: number;
+  membersPending: number;
   mediaDone: number;
   mediaFailed: number;
   lastCommit: { sha: string; at: string; lines: number } | null;
