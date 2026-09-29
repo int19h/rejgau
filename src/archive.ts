@@ -14,7 +14,7 @@ import { isArchived, publishedChannelIds, type ChannelInfo } from "./channels";
 import { parseConfig, type Config, type GuildConfig } from "./config";
 import { discordGet, DiscordError } from "./discord";
 import type { Env, OutboxEvent } from "./env";
-import { ConflictError, GitHub, GitHubError } from "./github";
+import { ConflictError, GitHub, GitHubAuthError, GitHubError } from "./github";
 import { emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "./media";
 import { dayPath, errorMessage, joinPath, log, maxSnowflake, monthTag, rawLine, snowflakeTime } from "./util";
 
@@ -583,10 +583,13 @@ export class GuildArchive extends DurableObject<Env> {
       this.synthetic(guild, result.ok ? "MEDIA_STORED" : "MEDIA_FAILED", result.record);
       this.sql.exec(`UPDATE media SET status = ? WHERE key = ?`, result.ok ? "done" : "failed", row.key);
     } catch (e) {
-      if (e instanceof GitHubError && e.retryAfterMs !== null) {
-        // Rate limited: back off globally without charging the item an attempt.
-        this.set("githubBackoffUntil", String(Date.now() + Math.max(e.retryAfterMs, 60_000)));
-        log("github_rate_limited", { retryAfterMs: e.retryAfterMs });
+      if (e instanceof GitHubError && (e.retryAfterMs !== null || e instanceof GitHubAuthError)) {
+        // Rate limited, or the App can't access the repo (a setup problem): back off globally
+        // without charging the item an attempt, so fixing the setup loses nothing.
+        const wait = e.retryAfterMs !== null ? Math.max(e.retryAfterMs, 60_000) : 5 * 60_000;
+        this.set("githubBackoffUntil", String(Date.now() + wait));
+        this.set("lastError", JSON.stringify({ at: new Date().toISOString(), error: errorMessage(e).slice(0, 500), status: e.status }));
+        log("github_backoff", { waitMs: wait, error: errorMessage(e) });
         return;
       }
       const attempts = row.attempts + 1;
@@ -815,6 +818,15 @@ export class GuildArchive extends DurableObject<Env> {
       this.busy = false;
       await this.scheduleAlarm();
     }
+  }
+
+  /** Puts failed media back in the queue (e.g. after fixing the GitHub setup). */
+  async retryFailedMedia(): Promise<{ requeued: number }> {
+    const n = this.sql.exec<{ c: number }>(`SELECT COUNT(*) AS c FROM media WHERE status = 'failed'`).one().c;
+    this.sql.exec(`UPDATE media SET status = 'pending', attempts = 0, next_at = 0 WHERE status = 'failed'`);
+    this.set("githubBackoffUntil", null);
+    await this.scheduleAlarm();
+    return { requeued: n };
   }
 
   /** Stops committing (events keep being buffered), e.g. while the admin rewrites history. */

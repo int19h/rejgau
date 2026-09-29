@@ -17,6 +17,13 @@ export class GitHubError extends Error {
   }
 }
 
+function authError(e: GitHubError): GitHubError {
+  if (e.retryAfterMs !== null || e.status >= 500) return e;
+  const auth = new GitHubAuthError(e.status, e.body, "", null);
+  auth.message = e.message;
+  return auth;
+}
+
 /** Builds a GitHubError from a failed response, recognizing rate-limit responses. */
 async function failure(res: Response, what: string): Promise<GitHubError> {
   const body = await res.text();
@@ -30,6 +37,9 @@ async function failure(res: Response, what: string): Promise<GitHubError> {
   }
   return new GitHubError(res.status, body, what, retryAfterMs);
 }
+
+/** The App can't act on the repo at all (not installed, wrong App ID or key): a setup problem. */
+export class GitHubAuthError extends GitHubError {}
 
 /** The branch moved (or appeared) between reading it and updating it. */
 export class ConflictError extends Error {}
@@ -144,7 +154,7 @@ export class GitHub {
     if (cached && cached.expiresAt - Date.now() > 5 * 60_000) return cached.token;
     const jwt = await appJwt(this.appId, this.privateKey);
     const inst = await this.raw("GET", `/repos/${this.repo}/installation`, undefined, `Bearer ${jwt}`);
-    if (!inst.ok) throw await failure(inst, "installation lookup (is the App installed on the repo?)");
+    if (!inst.ok) throw authError(await failure(inst, `installation lookup (is the GitHub App installed on ${this.repo}, and do GITHUB_APP_ID and the key match?)`));
     const { id } = (await inst.json()) as { id: number };
     const res = await this.raw(
       "POST",
@@ -152,7 +162,7 @@ export class GitHub {
       { repositories: [this.name], permissions: { contents: "write", metadata: "read" } },
       `Bearer ${jwt}`,
     );
-    if (!res.ok) throw await failure(res, "installation token");
+    if (!res.ok) throw authError(await failure(res, "installation token"));
     const t = (await res.json()) as { token: string; expires_at: string };
     tokenCache.set(this.repo, { token: t.token, expiresAt: Date.parse(t.expires_at) });
     return t.token;

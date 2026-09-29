@@ -54,6 +54,12 @@ export default {
         if (!post) break;
         await gateway(env).stop();
         return json({ ok: true });
+      case "/retry-media": {
+        if (!post) break;
+        const out: Record<string, unknown> = {};
+        for (const id of guilds) out[id] = await archive(id).retryFailedMedia();
+        return json(out);
+      }
       case "/flush":
       case "/pause":
       case "/resume": {
@@ -70,7 +76,7 @@ export default {
         return json(out);
       }
     }
-    return json({ error: "unknown route", routes: ["GET /status", "POST /start", "POST /stop", "POST /flush", "POST /pause", "POST /resume"] }, 404);
+    return json({ error: "unknown route", routes: ["GET /status", "POST /start", "POST /stop", "POST /flush", "POST /pause", "POST /resume", "POST /retry-media"] }, 404);
   },
 
   async scheduled(_controller, env): Promise<void> {
