@@ -169,7 +169,7 @@ Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized reques
 | `POST /start`, `POST /stop` | Start the Gateway session (also clears a fatal error, e.g. after fixing the token), or stop it. |
 | `POST /flush[?guild=ID]` | Commit everything buffered now. |
 | `POST /pause[?guild=ID]`, `POST /resume[?guild=ID]` | Stop or restart committing. Events keep being buffered meanwhile. |
-| `POST /reset?guild=ID` | Wipe the bot's state for a guild, so the next event bootstraps and backfills again. For test setups: delete the archive branch first, or the backfill appends duplicates. |
+| `POST /reset?guild=ID` | Wipe the bot's state for a guild and start it again right away: snapshot, channel selection and backfill. For test setups: delete the archive branch first, or the backfill appends duplicates. |
 | `POST /retry-media[?guild=ID]` | Re-queue media recorded as failed, e.g. after fixing the GitHub setup. When a key has several `MEDIA_*` records, the last one wins. |
 
 ## Removing messages from the archive

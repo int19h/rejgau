@@ -127,6 +127,11 @@ export class GuildArchive extends DurableObject<Env> {
     else this.sql.exec(`INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v);
   }
 
+  /** Records which guild this object archives (its ID isn't derivable from the object ID). */
+  private adopt(guildId: string): void {
+    if (!this.get("guildId")) this.set("guildId", guildId);
+  }
+
   private guildConfig(): { cfg: Config; guild: GuildConfig } | null {
     const guildId = this.get("guildId");
     if (!guildId) return null;
@@ -286,7 +291,7 @@ export class GuildArchive extends DurableObject<Env> {
   }
 
   private async ingestSerial(guildId: string, events: OutboxEvent[]): Promise<IngestResult> {
-    if (!this.get("guildId")) this.set("guildId", guildId);
+    this.adopt(guildId);
     const conf = this.guildConfig();
     if (!conf) return { handled: events.length }; // guild removed from config: drop
     const { guild } = conf;
@@ -865,7 +870,8 @@ export class GuildArchive extends DurableObject<Env> {
   }
 
   /** Commits everything buffered now (ignoring the flush schedule). */
-  async flushNow(): Promise<{ committed?: number; error?: string }> {
+  async flushNow(guildId: string): Promise<{ committed?: number; error?: string }> {
+    this.adopt(guildId);
     const conf = this.guildConfig();
     if (!conf) return { error: "guild not configured" };
     if (this.busy) return { error: "busy; try again" };
@@ -897,6 +903,31 @@ export class GuildArchive extends DurableObject<Env> {
     // abort() discards writes not yet confirmed on disk, so wait for the wipe before restarting.
     await this.ctx.storage.sync();
     this.ctx.abort("reset", { retryAlarm: false }); // restart with fresh tables
+  }
+
+  /**
+   * Starts archiving without waiting for an event (e.g. right after a reset): records the config,
+   * loads the channel tree over REST and queues the backfill.
+   */
+  start(guildId: string): Promise<{ started: boolean; error?: string }> {
+    const run = this.ingestChain.then(async () => {
+      this.adopt(guildId);
+      const conf = this.guildConfig();
+      if (!conf) return { started: false, error: "guild not configured" };
+      try {
+        this.checkConfigChange(conf.guild);
+        if (!this.get("initialized") && !(await this.tryBootstrap(conf.guild, guildId))) {
+          return { started: false, error: this.get("bootstrapError") ?? "bootstrap failed recently; the next event retries" };
+        }
+        return { started: true };
+      } catch (e) {
+        return { started: false, error: `${errorMessage(e)}; the next event retries` };
+      } finally {
+        await this.scheduleAlarm();
+      }
+    });
+    this.ingestChain = run.then(() => {}, () => {});
+    return run;
   }
 
   /** Puts failed media back in the queue (e.g. after fixing the GitHub setup). */
