@@ -1,0 +1,25 @@
+{
+  "name": "rejgau",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/unit && tsc --noEmit -p test/worker && tsc --noEmit -p reader && tsc --noEmit -p tools",
+    "test": "vitest run",
+    "build:site": "tsx tools/build.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.0.0",
+    "@cloudflare/workers-types": "^5.20260929.1",
+    "@types/node": "^22.20.4",
+    "discord-markdown-parser": "^1.3.1",
+    "esbuild": "^0.28.2",
+    "highlight.js": "^11.12.0",
+    "preact": "^10.29.8",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.143.0"
+  }
+}

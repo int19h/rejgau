@@ -1,0 +1,75 @@
+# Publishes a rejgau archive as a static site on GitHub Pages.
+#
+# Put this file on the archive repo's DEFAULT branch (e.g. main) as .github/workflows/pages.yml,
+# and set Settings → Pages → Source to "GitHub Actions". Note that a Pages site is public even
+# when the repository is private.
+#
+# Optional repository variables (Settings → Secrets and variables → Actions → Variables):
+#   REJGAU_REF    git ref (ideally a commit SHA) of int19h/rejgau to build with; default: main
+#   ARCHIVE_PATH  folder of the archive inside the branch; default: repo root
+#   ARCHIVE_BRANCH branch the bot writes to; default: archive
+#
+# Runs when the bot signals new commits (repository_dispatch, if "pages": true in its config),
+# hourly as a safety net, and on demand.
+
+name: Publish archive
+
+on:
+  repository_dispatch:
+    types: [archive-updated]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Coalesce bursts of updates; the deploy job below is never cancelled mid-way.
+    concurrency:
+      group: pages-build
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ vars.ARCHIVE_BRANCH || 'archive' }}
+          path: archive
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: int19h/rejgau
+          ref: ${{ vars.REJGAU_REF || 'main' }}
+          path: rejgau
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: rejgau/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: rejgau
+      - run: npm run build:site -- --archive "../archive/${{ vars.ARCHIVE_PATH }}" --out ../site
+        working-directory: rejgau
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only the deploy job gets Pages rights; the build job runs third-party packages.
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages-deploy
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
