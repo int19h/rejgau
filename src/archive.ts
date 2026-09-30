@@ -186,9 +186,10 @@ export class GuildArchive extends DurableObject<Env> {
 
   /**
    * Re-evaluates which channels are selected, recording each change. Newly selected channels get
-   * a REST cursor: "0" (full history) when backfilling, otherwise none.
+   * a REST cursor: "0" (full history) when backfilling, otherwise none. Changes caused by an event
+   * carry its time (`at`), so they file and sort with it.
    */
-  private reconcile(guild: GuildConfig, opts: { backfillThreads?: boolean; liveCreated?: string } = {}): void {
+  private reconcile(guild: GuildConfig, opts: { at?: number; backfillThreads?: boolean; liveCreated?: string } = {}): void {
     for (const [id, info] of this.channels) {
       if (info.deleted) continue;
       const now = isArchived(id, this.channels, guild) ? 1 : 0;
@@ -201,12 +202,12 @@ export class GuildArchive extends DurableObject<Env> {
           if (r) chain.push(JSON.parse(r.json));
           if (chain.length > 3) break;
         }
-        this.synthetic(guild, "CHANNEL_SELECTED", { channel: JSON.parse(row.json), ancestors: chain });
+        this.synthetic(guild, "CHANNEL_SELECTED", { channel: JSON.parse(row.json), ancestors: chain }, opts.at);
         const isThread = info.type === 10 || info.type === 11 || info.type === 12;
         const backfill = id !== opts.liveCreated && !NO_HISTORY_TYPES.has(info.type) && (guild.backfill || (isThread && opts.backfillThreads));
         this.sql.exec(`UPDATE channels SET selected = 1, cursor = ?, cursor_kind = ? WHERE id = ?`, backfill ? "0" : null, backfill ? "backfill" : null, id);
       } else {
-        this.synthetic(guild, "CHANNEL_UNSELECTED", { id });
+        this.synthetic(guild, "CHANNEL_UNSELECTED", { id }, opts.at);
         this.sql.exec(`UPDATE channels SET selected = 0, cursor = NULL, cursor_kind = NULL WHERE id = ?`, id);
       }
     }
@@ -374,7 +375,7 @@ export class GuildArchive extends DurableObject<Env> {
 
       case "THREAD_LIST_SYNC": {
         for (const th of d.threads ?? []) this.upsertChannel(th);
-        this.reconcile(guild);
+        this.reconcile(guild, { at: ev.at });
         const threads = (d.threads ?? []).filter((th: any) => this.isSelected(th.id));
         if (!threads.length) return;
         const ids = new Set(threads.map((th: any) => th.id));
@@ -400,14 +401,14 @@ export class GuildArchive extends DurableObject<Env> {
       if (ev.t.endsWith("_DELETE")) {
         if (publishedBefore) this.emit(guild, gw, ev.d);
         this.markDeleted(d.id);
-        this.reconcile(guild);
+        this.reconcile(guild, { at: ev.at });
         return;
       }
       this.upsertChannel(d);
       // Brand-new threads/channels have no history worth fetching. (THREAD_CREATE is also sent when
       // the bot is added to an existing private thread; then `newly_created` is absent.)
       const live = ev.t === "CHANNEL_CREATE" || (ev.t === "THREAD_CREATE" && d.newly_created);
-      this.reconcile(guild, { liveCreated: live ? d.id : undefined });
+      this.reconcile(guild, { at: ev.at, liveCreated: live ? d.id : undefined });
       if (publishedBefore || publishedChannelIds(this.channels, guild).has(d.id)) this.emit(guild, gw, ev.d);
       return;
     }
@@ -420,7 +421,7 @@ export class GuildArchive extends DurableObject<Env> {
     // Everything else is channel-scoped: messages, reactions, polls, pins, …
     const channelId: string | undefined = d.channel_id;
     if (!channelId) return;
-    if (await this.resolveChannel(channelId)) this.reconcile(guild); // newly learned channels may be selected
+    if (await this.resolveChannel(channelId)) this.reconcile(guild, { at: ev.at }); // newly learned channels may be selected
     if (!this.isSelected(channelId)) return;
     this.emit(guild, gw, ev.d);
 
@@ -448,7 +449,7 @@ export class GuildArchive extends DurableObject<Env> {
       }
     }
     // Threads first seen after a gap may have been created during it: fetch their history.
-    this.reconcile(guild, { backfillThreads: initialized });
+    this.reconcile(guild, { at: line.at, backfillThreads: initialized });
     if (initialized) {
       // A new session means events may have been missed: catch up every selected channel. A
       // channel with no known message starts from its own ID (messages always sort after it).
@@ -893,7 +894,9 @@ export class GuildArchive extends DurableObject<Env> {
   async reset(): Promise<void> {
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
-    this.ctx.abort("reset"); // restart with fresh tables
+    // abort() discards writes not yet confirmed on disk, so wait for the wipe before restarting.
+    await this.ctx.storage.sync();
+    this.ctx.abort("reset", { retryAlarm: false }); // restart with fresh tables
   }
 
   /** Puts failed media back in the queue (e.g. after fixing the GitHub setup). */
