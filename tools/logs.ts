@@ -5,8 +5,8 @@
 //   README.md                                server index: channels by category
 //   <channel>/README.md                      channel index: days with messages, threads
 //   <channel>/<YYYY>/<MM>/<DD>.md            one day of messages
-//   <channel>/threads/<thread>/…             threads, laid out like channels
-// Folder names are channel names (made path-safe); a clash gets the channel ID appended.
+//   <channel>/threads/<YYYY-MM-DD>-<thread>.md  a whole thread (dated by its creation)
+// Names come from channel names (made path-safe); a clash gets the channel ID appended.
 
 import { posix } from "node:path";
 import { refForUrl, stickerRef } from "../src/media";
@@ -66,8 +66,10 @@ function channelLabel(c: any): string {
 }
 
 interface Layout {
-  /** channel id → folder (no trailing slash) */
+  /** top-level channel id → folder (no trailing slash) */
   dir: Map<string, string>;
+  /** archived channel or thread id → the page for it: a channel's README.md, or a thread's file */
+  page: Map<string, string>;
   /** channel id → its messages, oldest first */
   messages: Map<string, MessageState[]>;
   /** channel id → day → messages */
@@ -95,25 +97,29 @@ function layout(state: ArchiveState): Layout {
     days.set(id, byDay);
   }
 
-  // Folders: top-level channels first, then threads inside their parent's folder.
+  // Top-level channels get folders; threads get one file each in their parent's folder.
   const dir = new Map<string, string>();
+  const page = new Map<string, string>();
   const taken = new Set<string>();
-  const assign = (id: string, parent: string) => {
-    const c = state.channels.get(id)!.c;
-    let name = posix.join(parent, slug(c.name, id));
-    if (taken.has(name.toLowerCase())) name = `${name}-${id}`;
+  /** A unique path (compared case-insensitively, for case-insensitive file systems). */
+  const claim = (path: string, id: string) => {
+    const name = taken.has(path.toLowerCase()) ? `${path}-${id}` : path;
     taken.add(name.toLowerCase());
-    dir.set(id, name);
+    return name;
   };
   // Channels with nothing archived (e.g. selected but unreadable) are left out.
   const hasThreads = (id: string) => [...messages.keys()].some((t) => state.channels.get(t)?.c.parent_id === id);
   const selected = [...state.channels].filter(([id, ch]) => ch.selected && MESSAGE_CHANNEL_TYPES.has(ch.c.type) && (messages.has(id) || hasThreads(id)));
   const sortKey = ([id, ch]: [string, { c: any }]) => [ch.c.position ?? 0, id] as const;
   const ordered = (list: typeof selected) => list.sort((a, b) => sortKey(a)[0] - sortKey(b)[0] || (BigInt(a[0]) < BigInt(b[0]) ? -1 : 1));
-  for (const [id] of ordered(selected.filter(([, ch]) => !THREAD_TYPES.has(ch.c.type)))) assign(id, "");
+  for (const [id, ch] of ordered(selected.filter(([, ch]) => !THREAD_TYPES.has(ch.c.type)))) {
+    const d = claim(slug(ch.c.name, id), id);
+    dir.set(id, d);
+    page.set(id, `${d}/README.md`);
+  }
   for (const [id, ch] of ordered(selected.filter(([, ch]) => THREAD_TYPES.has(ch.c.type)))) {
     const parent = dir.get(ch.c.parent_id);
-    assign(id, parent ? `${parent}/threads` : "threads");
+    page.set(id, `${claim(posix.join(parent ? `${parent}/threads` : "threads", `${dayOf(id)}-${slug(ch.c.name, id)}`), id)}.md`);
   }
   const names = new Map<string, string>();
   for (const [id, r] of state.reactors) names.set(id, displayName(r.user, r.member));
@@ -122,7 +128,7 @@ function layout(state: ArchiveState): Layout {
     if (m.author?.id) names.set(m.author.id, displayName(m.author, m.member ?? state.memberSnapshots.get(m.author.id)));
     for (const u of m.mentions ?? []) if (u?.id) names.set(u.id, displayName(u, u.member));
   }
-  return { dir, messages, days, names };
+  return { dir, page, messages, days, names };
 }
 
 interface Env {
@@ -133,12 +139,17 @@ interface Env {
   guildId: string;
 }
 
+/** The file a message of a channel or thread is rendered in. */
+function messageFile(l: Layout, channelId: string, messageId: string): string | undefined {
+  const dir = l.dir.get(channelId);
+  return dir ? `${dir}/${dayPath(dayOf(messageId))}` : l.page.get(channelId);
+}
+
 /** Where a message is rendered: file path plus anchor, if it's in the logs. */
 function messageHref(env: Env, channelId: string | undefined, messageId: string | undefined): string | null {
-  if (!channelId || !messageId) return null;
-  const dir = env.layout.dir.get(channelId);
-  if (!dir || !env.state.messages.has(messageId)) return null;
-  return `${relLink(env.file, `${dir}/${dayPath(dayOf(messageId))}`)}#m${messageId}`;
+  if (!channelId || !messageId || !env.state.messages.has(messageId)) return null;
+  const file = messageFile(env.layout, channelId, messageId);
+  return file ? `${relLink(env.file, file)}#m${messageId}` : null;
 }
 
 function gfmContext(env: Env, m: any): GfmContext {
@@ -150,8 +161,8 @@ function gfmContext(env: Env, m: any): GfmContext {
     channel: (id) => {
       const c = env.state.channels.get(id)?.c;
       if (!c) return null;
-      const dir = env.layout.dir.get(id);
-      return { name: c.name ?? id, href: dir ? relLink(env.file, `${dir}/README.md`) : undefined };
+      const page = env.layout.page.get(id);
+      return { name: c.name ?? id, href: page ? relLink(env.file, page) : undefined };
     },
   };
 }
@@ -349,9 +360,9 @@ function renderMessage(env: Env, ms: MessageState): string {
     let text = escapeText(SYSTEM_TEXT[m.type] ?? "sent a system message.");
     if (m.type === 18) {
       const thread = m.thread?.id ?? m.message_reference?.channel_id;
-      const dir = thread ? env.layout.dir.get(thread) : undefined;
+      const page = thread ? env.layout.page.get(thread) : undefined;
       const title = `**${escapeLine(m.content || "thread")}**`;
-      text += ` ${dir ? `[${title}](${relLink(env.file, `${dir}/README.md`)})` : title}`;
+      text += ` ${page ? `[${title}](${relLink(env.file, page)})` : title}`;
     }
     if (m.type === 6) {
       const href = messageHref(env, m.message_reference?.channel_id, m.message_reference?.message_id);
@@ -417,11 +428,11 @@ function renderMessage(env: Env, ms: MessageState): string {
   }
 
   const threadId = m.thread?.id ?? (env.state.channels.has(m.id) && m.channel_id !== m.id ? m.id : undefined);
-  const threadDir = threadId ? env.layout.dir.get(threadId) : undefined;
-  if (threadId && threadDir) {
+  const threadPage = threadId ? env.layout.page.get(threadId) : undefined;
+  if (threadId && threadPage) {
     const count = env.layout.messages.get(threadId)?.length ?? 0;
     const tname = env.state.channels.get(threadId)?.c.name ?? m.thread?.name ?? "Thread";
-    out.push(`🧵 [${escapeLine(tname)}](${relLink(env.file, `${threadDir}/README.md`)}) · ${plural(count, "message")}`);
+    out.push(`🧵 [${escapeLine(tname)}](${relLink(env.file, threadPage)}) · ${plural(count, "message")}`);
   }
   return out.join("\n\n");
 }
@@ -448,17 +459,14 @@ function channelIndex(env: Env, channelId: string): string {
   const dir = env.layout.dir.get(channelId)!;
   const parts = [`# ${channelLabel(c)}`];
   if (c.topic) parts.push(quote(paragraphs(escapeLines(c.topic))));
-  const parentDir = THREAD_TYPES.has(c.type) ? env.layout.dir.get(c.parent_id) : undefined;
-  const up = parentDir ? `${parentDir}/README.md` : "README.md";
-  const upLabel = up === "README.md" ? escapeLine(env.state.guild.name ?? "Server") : channelLabel(env.state.channels.get(c.parent_id)?.c);
-  parts.push(`<sub>[${upLabel}](${relLink(env.file, up)})${ch.deleted ? " · deleted channel" : ""} · times are UTC</sub>`);
+  parts.push(`<sub>[${escapeLine(env.state.guild.name ?? "Server")}](${relLink(env.file, "README.md")})${ch.deleted ? " · deleted channel" : ""} · times are UTC</sub>`);
 
-  const threads = [...env.layout.dir.keys()].filter((id) => env.state.channels.get(id)?.c.parent_id === channelId && THREAD_TYPES.has(env.state.channels.get(id)!.c.type));
+  const threads = [...env.layout.page.keys()].filter((id) => !env.layout.dir.has(id) && env.state.channels.get(id)?.c.parent_id === channelId);
   if (threads.length) {
     parts.push("## Threads");
     parts.push(
       threads
-        .map((id) => `- [${escapeLine(env.state.channels.get(id)!.c.name ?? id)}](${relLink(env.file, `${env.layout.dir.get(id)}/README.md`)}) · ${plural(env.layout.messages.get(id)?.length ?? 0, "message")}`)
+        .map((id) => `- ${dayOf(id)} [${escapeLine(env.state.channels.get(id)!.c.name ?? id)}](${relLink(env.file, env.layout.page.get(id)!)}) · ${plural(env.layout.messages.get(id)?.length ?? 0, "message")}`)
         .join("\n"),
     );
   }
@@ -481,7 +489,7 @@ function channelIndex(env: Env, channelId: string): string {
 function rootIndex(env: Env, builtAt: string): string {
   const g = env.state.guild;
   const parts = [`# ${escapeLine(g.name ?? "Archive")}`, `<sub>Rendered from the rejgau archive on ${dateTime(builtAt)} UTC. Times are UTC. The raw logs are on the \`archive\` branch.</sub>`];
-  const top = [...env.layout.dir.keys()].filter((id) => !THREAD_TYPES.has(env.state.channels.get(id)!.c.type));
+  const top = [...env.layout.dir.keys()];
   const groups = new Map<string, string[]>();
   for (const id of top) {
     const c = env.state.channels.get(id)!.c;
@@ -499,12 +507,30 @@ function rootIndex(env: Env, builtAt: string): string {
   return `${parts.join("\n\n")}\n`;
 }
 
+/** A whole thread in one file, with a heading for each day it spans. */
+function threadFile(env: Env, threadId: string): string {
+  const ch = env.state.channels.get(threadId)!;
+  const parent = env.state.channels.get(ch.c.parent_id)?.c;
+  const parentPage = env.layout.page.get(ch.c.parent_id);
+  const up = parentPage ? `[${channelLabel(parent)}](${relLink(env.file, parentPage)})` : `[${escapeLine(env.state.guild.name ?? "Server")}](${relLink(env.file, "README.md")})`;
+  const created = ch.c.thread_metadata?.create_timestamp ?? new Date(snowflakeTime(threadId)).toISOString();
+  const nav = `<sub>${up} · started ${dateTime(created)} UTC${ch.deleted ? " · deleted thread" : ""} · times are UTC</sub>`;
+  const parts = [`# ${channelLabel(ch.c)}`, nav, "---"];
+  for (const [day, list] of [...(env.layout.days.get(threadId) ?? [])].sort(([a], [b]) => a.localeCompare(b))) {
+    parts.push(`## ${day}`);
+    for (const ms of list) parts.push(renderMessage(env, ms));
+  }
+  parts.push("---", nav);
+  return `${parts.join("\n\n")}\n`;
+}
+
 /** Builds every log file: path → GFM text. */
 export function buildLogs(state: ArchiveState, builtAt = new Date().toISOString()): Map<string, string> {
   const files = new Map<string, string>();
   const l = layout(state);
   const env = (file: string): Env => ({ state, layout: l, file, guildId: state.guild.id ?? "" });
   files.set("README.md", rootIndex(env("README.md"), builtAt));
+  for (const [id, page] of l.page) if (!l.dir.has(id)) files.set(page, threadFile(env(page), id));
   for (const [id, dir] of l.dir) {
     files.set(`${dir}/README.md`, channelIndex(env(`${dir}/README.md`), id));
     const days = [...(l.days.get(id)?.keys() ?? [])].sort();

@@ -37,13 +37,13 @@ describe("buildLogs", () => {
       "general/2026/09/29.md",
       "general/2026/09/30.md",
       "general/README.md",
-      "general/threads/a-thread/2026/09/29.md",
-      "general/threads/a-thread/README.md",
+      "general/threads/2026-09-29-a-thread.md",
     ]);
     const root = files.get("README.md")!;
     expect(root).toContain("# Guild \\<b\\>");
     expect(root).toContain("## Text\n\n- [#general](general/README.md) · 3 messages");
-    expect(files.get("general/README.md")).toContain("- [a thread](threads/a-thread/README.md) · 1 message");
+    expect(files.get("general/README.md")).toContain("- 2026-09-29 [a thread](threads/2026-09-29-a-thread.md) · 1 message");
+    expect(files.get("general/threads/2026-09-29-a-thread.md")).toContain("# 🧵 a thread\n\n<sub>[#general](../README.md) · started 2026-09-29 17:13 UTC · times are UTC</sub>");
   });
 
   it("renders a day with anchors, navigation and archived media; folds messages with spoilers", () => {
@@ -63,6 +63,6 @@ describe("buildLogs", () => {
   it("marks deleted messages and links threads", () => {
     const day = files.get("general/2026/09/30.md")!;
     expect(day).toMatch(/🗑 deleted 2026-09-29 \d\d:\d\d UTC/);
-    expect(day).toContain("🧵 [a thread](../../threads/a-thread/README.md) · 1 message");
+    expect(day).toContain("🧵 [a thread](../../threads/2026-09-29-a-thread.md) · 1 message");
   });
 });
