@@ -4,9 +4,10 @@
 // Layout (all times UTC):
 //   README.md                                server index: channels by category
 //   <channel>/README.md                      channel index: days with messages, threads
-//   <channel>/<YYYY>/<MM>/<DD>.md            one day of messages
-//   <channel>/threads/<YYYY-MM-DD>-<thread>.md  a whole thread (dated by its creation)
-// Names come from channel names (made path-safe); a clash gets the channel ID appended.
+//   <channel>/<YYYY>/<MM>/<DD>.md            one day of the channel's messages
+//   <channel>/<YYYY>/<MM>/<DD>/<thread>.md   one day of a thread's messages
+// Names come from channel names (made path-safe). A clash gets the channel ID appended: between
+// channels, or between threads with messages on the same day (the older thread keeps the name).
 
 import { posix } from "node:path";
 import { refForUrl, stickerRef } from "../src/media";
@@ -68,8 +69,10 @@ function channelLabel(c: any): string {
 interface Layout {
   /** top-level channel id → folder (no trailing slash) */
   dir: Map<string, string>;
-  /** archived channel or thread id → the page for it: a channel's README.md, or a thread's file */
+  /** archived channel or thread id → the page for it: a channel's README.md, a thread's first day */
   page: Map<string, string>;
+  /** thread id → day → file */
+  threadDays: Map<string, Map<string, string>>;
   /** channel id → its messages, oldest first */
   messages: Map<string, MessageState[]>;
   /** channel id → day → messages */
@@ -117,9 +120,16 @@ function layout(state: ArchiveState): Layout {
     dir.set(id, d);
     page.set(id, `${d}/README.md`);
   }
-  for (const [id, ch] of ordered(selected.filter(([, ch]) => THREAD_TYPES.has(ch.c.type)))) {
-    const parent = dir.get(ch.c.parent_id);
-    page.set(id, `${claim(posix.join(parent ? `${parent}/threads` : "threads", `${dayOf(id)}-${slug(ch.c.name, id)}`), id)}.md`);
+  // Threads, oldest first so an older thread keeps its name when two clash on a day.
+  const threadDays = new Map<string, Map<string, string>>();
+  const threads = selected.filter(([, ch]) => THREAD_TYPES.has(ch.c.type)).sort((a, b) => (BigInt(a[0]) < BigInt(b[0]) ? -1 : 1));
+  for (const [id, ch] of threads) {
+    const parent = dir.get(ch.c.parent_id) ?? "threads";
+    const files = new Map<string, string>();
+    for (const day of [...(days.get(id)?.keys() ?? [])].sort()) files.set(day, `${claim(`${parent}/${day.replace(/-/g, "/")}/${slug(ch.c.name, id)}`, id)}.md`);
+    threadDays.set(id, files);
+    const first = files.values().next().value;
+    if (first) page.set(id, first);
   }
   const names = new Map<string, string>();
   for (const [id, r] of state.reactors) names.set(id, displayName(r.user, r.member));
@@ -128,7 +138,7 @@ function layout(state: ArchiveState): Layout {
     if (m.author?.id) names.set(m.author.id, displayName(m.author, m.member ?? state.memberSnapshots.get(m.author.id)));
     for (const u of m.mentions ?? []) if (u?.id) names.set(u.id, displayName(u, u.member));
   }
-  return { dir, page, messages, days, names };
+  return { dir, page, threadDays, messages, days, names };
 }
 
 interface Env {
@@ -142,7 +152,7 @@ interface Env {
 /** The file a message of a channel or thread is rendered in. */
 function messageFile(l: Layout, channelId: string, messageId: string): string | undefined {
   const dir = l.dir.get(channelId);
-  return dir ? `${dir}/${dayPath(dayOf(messageId))}` : l.page.get(channelId);
+  return dir ? `${dir}/${dayPath(dayOf(messageId))}` : l.threadDays.get(channelId)?.get(dayOf(messageId));
 }
 
 /** Where a message is rendered: file path plus anchor, if it's in the logs. */
@@ -457,7 +467,11 @@ function dayFile(env: Env, channelId: string, day: string, list: MessageState[],
   ]
     .filter(Boolean)
     .join(" · ");
-  const parts = [`# ${channelLabel(c)} · ${day}`, `<sub>${escapeLine(env.state.guild.name ?? "")} · times are UTC</sub>`, nav, "---"];
+  const parts = [`# ${channelLabel(c)} · ${day}`, `<sub>${escapeLine(env.state.guild.name ?? "")} · times are UTC</sub>`, nav];
+  // Threads of this channel with messages on the same day.
+  const threads = [...env.layout.threadDays].filter(([id, byDay]) => byDay.has(day) && env.state.channels.get(id)?.c.parent_id === channelId);
+  if (threads.length) parts.push(`🧵 ${threads.map(([id, byDay]) => `[${escapeLine(env.state.channels.get(id)!.c.name ?? id)}](${relLink(env.file, byDay.get(day)!)})`).join(" · ")}`);
+  parts.push("---");
   for (const ms of list) parts.push(renderMessage(env, ms));
   parts.push("---", nav);
   return `${parts.join("\n\n")}\n`;
@@ -471,12 +485,15 @@ function channelIndex(env: Env, channelId: string): string {
   if (c.topic) parts.push(quote(paragraphs(escapeLines(c.topic))));
   parts.push(`<sub>[${escapeLine(env.state.guild.name ?? "Server")}](${relLink(env.file, "README.md")})${ch.deleted ? " · deleted channel" : ""} · times are UTC</sub>`);
 
-  const threads = [...env.layout.page.keys()].filter((id) => !env.layout.dir.has(id) && env.state.channels.get(id)?.c.parent_id === channelId);
+  const threads = [...env.layout.threadDays.keys()].filter((id) => env.state.channels.get(id)?.c.parent_id === channelId);
   if (threads.length) {
     parts.push("## Threads");
     parts.push(
       threads
-        .map((id) => `- ${dayOf(id)} [${escapeLine(env.state.channels.get(id)!.c.name ?? id)}](${relLink(env.file, env.layout.page.get(id)!)}) · ${plural(env.layout.messages.get(id)?.length ?? 0, "message")}`)
+        .map((id) => {
+          const days = [...env.layout.threadDays.get(id)!].map(([day, file]) => `[${day}](${relLink(env.file, file)})`);
+          return `- **${escapeLine(env.state.channels.get(id)!.c.name ?? id)}** · ${plural(env.layout.messages.get(id)?.length ?? 0, "message")} · ${days.join(" · ")}`;
+        })
         .join("\n"),
     );
   }
@@ -517,19 +534,27 @@ function rootIndex(env: Env, builtAt: string): string {
   return `${parts.join("\n\n")}\n`;
 }
 
-/** A whole thread in one file, with a heading for each day it spans. */
-function threadFile(env: Env, threadId: string): string {
+/** One day of a thread. */
+function threadDayFile(env: Env, threadId: string, day: string, list: MessageState[], prev?: string, next?: string): string {
   const ch = env.state.channels.get(threadId)!;
-  const parent = env.state.channels.get(ch.c.parent_id)?.c;
-  const parentPage = env.layout.page.get(ch.c.parent_id);
-  const up = parentPage ? `[${channelLabel(parent)}](${relLink(env.file, parentPage)})` : `[${escapeLine(env.state.guild.name ?? "Server")}](${relLink(env.file, "README.md")})`;
+  const files = env.layout.threadDays.get(threadId)!;
+  const parentId = ch.c.parent_id;
+  const parentDir = env.layout.dir.get(parentId);
+  const parentDay = parentDir && env.layout.days.get(parentId)?.has(day) ? `${parentDir}/${dayPath(day)}` : null;
+  const parentLink = parentDir
+    ? `[${channelLabel(env.state.channels.get(parentId)?.c)}](${relLink(env.file, parentDay ?? `${parentDir}/README.md`)})`
+    : `[${escapeLine(env.state.guild.name ?? "Server")}](${relLink(env.file, "README.md")})`;
+  const nav = [
+    prev ? `[← ${prev}](${relLink(env.file, files.get(prev)!)})` : "",
+    parentLink,
+    next ? `[${next} →](${relLink(env.file, files.get(next)!)})` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const created = ch.c.thread_metadata?.create_timestamp ?? new Date(snowflakeTime(threadId)).toISOString();
-  const nav = `<sub>${up} · started ${dateTime(created)} UTC${ch.deleted ? " · deleted thread" : ""} · times are UTC</sub>`;
-  const parts = [`# ${channelLabel(ch.c)}`, nav, "---"];
-  for (const [day, list] of [...(env.layout.days.get(threadId) ?? [])].sort(([a], [b]) => a.localeCompare(b))) {
-    parts.push(`## ${day}`);
-    for (const ms of list) parts.push(renderMessage(env, ms));
-  }
+  const sub = `<sub>thread started ${dateTime(created)} UTC${ch.deleted ? " · deleted thread" : ""} · times are UTC</sub>`;
+  const parts = [`# ${channelLabel(ch.c)} · ${day}`, sub, nav, "---"];
+  for (const ms of list) parts.push(renderMessage(env, ms));
   parts.push("---", nav);
   return `${parts.join("\n\n")}\n`;
 }
@@ -540,7 +565,10 @@ export function buildLogs(state: ArchiveState, builtAt = new Date().toISOString(
   const l = layout(state);
   const env = (file: string): Env => ({ state, layout: l, file, guildId: state.guild.id ?? "" });
   files.set("README.md", rootIndex(env("README.md"), builtAt));
-  for (const [id, page] of l.page) if (!l.dir.has(id)) files.set(page, threadFile(env(page), id));
+  for (const [id, byDay] of l.threadDays) {
+    const days = [...byDay.keys()];
+    days.forEach((day, i) => files.set(byDay.get(day)!, threadDayFile(env(byDay.get(day)!), id, day, l.days.get(id)!.get(day)!, days[i - 1], days[i + 1])));
+  }
   for (const [id, dir] of l.dir) {
     files.set(`${dir}/README.md`, channelIndex(env(`${dir}/README.md`), id));
     const days = [...(l.days.get(id)?.keys() ?? [])].sort();

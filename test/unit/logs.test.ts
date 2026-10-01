@@ -35,15 +35,17 @@ describe("buildLogs", () => {
       "General-12/README.md",
       "README.md",
       "general/2026/09/29.md",
+      "general/2026/09/29/a-thread.md",
       "general/2026/09/30.md",
       "general/README.md",
-      "general/threads/2026-09-29-a-thread.md",
     ]);
     const root = files.get("README.md")!;
     expect(root).toContain("# Guild \\<b\\>");
     expect(root).toContain("## Text\n\n- [#general](general/README.md) · 3 messages");
-    expect(files.get("general/README.md")).toContain("- 2026-09-29 [a thread](threads/2026-09-29-a-thread.md) · 1 message");
-    expect(files.get("general/threads/2026-09-29-a-thread.md")).toContain("# 🧵 a thread\n\n<sub>[#general](../README.md) · started 2026-09-29 17:13 UTC · times are UTC</sub>");
+    expect(files.get("general/README.md")).toContain("- **a thread** · 1 message · [2026-09-29](2026/09/29/a-thread.md)");
+    const thread = files.get("general/2026/09/29/a-thread.md")!;
+    expect(thread).toContain("# 🧵 a thread · 2026-09-29\n\n<sub>thread started 2026-09-29 17:13 UTC · times are UTC</sub>\n\n[#general](../29.md)");
+    expect(files.get("general/2026/09/29.md")).toContain("🧵 [a thread](29/a-thread.md)");
   });
 
   it("renders a day with anchors, navigation and archived media; folds messages with spoilers", () => {
@@ -63,7 +65,7 @@ describe("buildLogs", () => {
   it("marks deleted messages and links threads", () => {
     const day = files.get("general/2026/09/30.md")!;
     expect(day).toMatch(/🗑 deleted 2026-09-29 \d\d:\d\d UTC/);
-    expect(day).toContain("🧵 [a thread](../../threads/2026-09-29-a-thread.md) · 1 message");
+    expect(day).toContain("🧵 [a thread](29/a-thread.md) · 1 message");
   });
 });
 
@@ -79,5 +81,29 @@ describe("message headers", () => {
     const day = files.get("general/2026/09/29.md")!;
     expect(day).toContain(`<tt><b>&lt;b&gt;&amp;co_*</b> <kbd>APP</kbd> · 17:13</tt>`);
     expect(day).toContain(`<p align="center"><tt>→ <b>Alice</b> joined the server. · <a id="m${ID2}" href="#m${ID2}">17:13</a></tt></p>`);
+  });
+});
+
+describe("threads", () => {
+  it("split by day; a same-day name clash renames only the newer thread, only on that day", () => {
+    const T1 = "1554541602075316300"; // 2026-09-29
+    const T2 = "1554541602075316301";
+    const NEXT_DAY = "1554900000000000000"; // 2026-09-30
+    const files = buildLogs(
+      fold([
+        line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+        line("CHANNEL_SELECTED", { channel: { id: T1, name: "Topic", type: 11, parent_id: "11" } }, 1, "rejgau"),
+        line("CHANNEL_SELECTED", { channel: { id: T2, name: "topic", type: 11, parent_id: "11" } }, 2, "rejgau"),
+        line("MESSAGE_CREATE", M("1554541602075316400", T1), 3),
+        line("MESSAGE_CREATE", M("1554541602075316401", T2), 4),
+        line("MESSAGE_CREATE", M(NEXT_DAY, T2), 5),
+      ]),
+    );
+    expect([...files.keys()].filter((k) => k.includes("/09/")).sort()).toEqual([
+      "general/2026/09/29/Topic.md",
+      `general/2026/09/29/topic-${T2}.md`,
+      "general/2026/09/30/topic.md",
+    ]);
+    expect(files.get(`general/2026/09/29/topic-${T2}.md`)).toContain("[2026-09-30 →](../30/topic.md)");
   });
 });
