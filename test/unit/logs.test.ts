@@ -49,7 +49,7 @@ describe("buildLogs", () => {
   it("renders a day with anchors, navigation and archived media; folds messages with spoilers", () => {
     const day = files.get("general/2026/09/29.md")!;
     expect(day).toContain("[#general](../../README.md) · [2026-09-30 →](30.md)");
-    expect(day).toContain(`**Alice** · 17:13 <a id="m${ID1}"></a>\n\n<details><summary>Spoiler</summary>\n\nhello ||secret||\n\n![p.png](<https://github.com/o/r/releases/download/media-2026-09/att-3-p.png>)\n\n</details>`);
+    expect(day).toContain(`<p align="center"><a id="m${ID1}" href="#m${ID1}"><tt><b>Alice</b> · 17:13</tt></a></p>\n\n<details><summary>Spoiler</summary>\n\nhello ||secret||\n\n![p.png](<https://github.com/o/r/releases/download/media-2026-09/att-3-p.png>)\n\n</details>`);
   });
 
   it("links replies to the original, and keeps earlier versions of edited messages", () => {
@@ -64,5 +64,20 @@ describe("buildLogs", () => {
     const day = files.get("general/2026/09/30.md")!;
     expect(day).toMatch(/🗑 deleted 2026-09-29 \d\d:\d\d UTC/);
     expect(day).toContain("🧵 [a thread](../../threads/2026-09-29-a-thread.md) · 1 message");
+  });
+});
+
+describe("message headers", () => {
+  it("are HTML-escaped (no Markdown inside an HTML block) and carry badges", () => {
+    const files = buildLogs(
+      fold([
+        line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+        line("MESSAGE_CREATE", M(ID1, "11", { author: { id: "8", username: "x", global_name: "<b>&co_*", bot: true } }), 1),
+        line("MESSAGE_CREATE", M(ID2, "11", { type: 7 }), 2),
+      ]),
+    );
+    const day = files.get("general/2026/09/29.md")!;
+    expect(day).toContain(`<tt><b>&lt;b&gt;&amp;co_*</b> <kbd>APP</kbd> · 17:13</tt>`);
+    expect(day).toContain(`<p align="center"><tt>→ <b>Alice</b> joined the server. · <a id="m${ID2}" href="#m${ID2}">17:13</a></tt></p>`);
   });
 });

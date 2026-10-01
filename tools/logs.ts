@@ -12,7 +12,7 @@ import { posix } from "node:path";
 import { refForUrl, stickerRef } from "../src/media";
 import { MESSAGE_CHANNEL_TYPES, NORMAL_TYPES, SYSTEM_TEXT, THREAD_TYPES } from "../reader/src/data";
 import { tallyCount, type ArchiveState, type MessageState } from "./fold";
-import { customEmoji, escapeLine, escapeText, inlineCode, link, linkUrl, paragraphs, quote, renderMarkdown, type GfmContext } from "./gfm";
+import { customEmoji, escapeHtml, escapeLine, escapeText, inlineCode, link, linkUrl, paragraphs, quote, renderMarkdown, type GfmContext } from "./gfm";
 
 const DISCORD_EPOCH = 1420070400000n;
 const snowflakeTime = (id: string) => Number((BigInt(id) >> 22n) + DISCORD_EPOCH);
@@ -348,33 +348,43 @@ function authorName(env: Env, m: any): string {
   return displayName(m.author, m.member ?? fallback);
 }
 
+/**
+ * A message header: a centred line, linked to itself. Nothing rendered from Discord is centred
+ * (user text can't contain raw HTML), so these mark message boundaries unambiguously. Inside this
+ * HTML block GFM applies no Markdown, so text is HTML-escaped.
+ */
+function header(id: string, html: string): string {
+  return `<p align="center"><a id="m${id}" href="#m${id}"><tt>${html}</tt></a></p>`;
+}
+
 function renderMessage(env: Env, ms: MessageState): string {
   const m = ms.m;
   const ctx = gfmContext(env, m);
-  const anchor = `<a id="m${m.id}"></a>`;
   const ts = m.timestamp ?? new Date(snowflakeTime(m.id)).toISOString();
-  const name = `**${escapeLine(authorName(env, m))}**`;
+  const name = `<b>${escapeHtml(authorName(env, m))}</b>`;
   const out: string[] = [];
 
   if (!NORMAL_TYPES.has(m.type ?? 0)) {
-    let text = escapeText(SYSTEM_TEXT[m.type] ?? "sent a system message.");
+    // System messages (joins, boosts, pins, new threads) are a single centred line. Links in it
+    // can't nest inside the header's self-link, so here only the time links to the message.
+    let text = escapeHtml(SYSTEM_TEXT[m.type] ?? "sent a system message.");
     if (m.type === 18) {
       const thread = m.thread?.id ?? m.message_reference?.channel_id;
       const page = thread ? env.layout.page.get(thread) : undefined;
-      const title = `**${escapeLine(m.content || "thread")}**`;
-      text += ` ${page ? `[${title}](${relLink(env.file, page)})` : title}`;
+      const title = `<b>${escapeHtml(m.content || "thread")}</b>`;
+      text += ` ${page ? `<a href="${escapeHtml(relLink(env.file, page))}">${title}</a>` : title}`;
     }
     if (m.type === 6) {
       const href = messageHref(env, m.message_reference?.channel_id, m.message_reference?.message_id);
-      if (href) text = `pinned [a message](${href}) to this channel.`;
+      if (href) text = `pinned <a href="${escapeHtml(href)}">a message</a> to this channel.`;
     }
-    out.push(`→ ${name} ${text} · ${hhmm(ts)} ${anchor}`);
+    out.push(`<p align="center"><tt>→ ${name} ${text} · <a id="m${m.id}" href="#m${m.id}">${hhmm(ts)}</a></tt></p>`);
     if (ms.deletedAt) out.push(`<sub>🗑 deleted ${dateTime(ms.deletedAt)} UTC</sub>`);
     return out.join("\n\n");
   }
 
-  const badges = [m.webhook_id && !m.application_id ? "`WEBHOOK`" : m.author?.bot ? "`APP`" : "", ms.pinned ? "📌" : ""].filter(Boolean).join(" ");
-  out.push(`${name}${badges ? ` ${badges}` : ""} · ${hhmm(ts)} ${anchor}`);
+  const badges = [m.webhook_id && !m.application_id ? "<kbd>WEBHOOK</kbd>" : m.author?.bot ? "<kbd>APP</kbd>" : "", ms.pinned ? "📌" : ""].filter(Boolean).join(" ");
+  out.push(header(m.id, `${name}${badges ? ` ${badges}` : ""} · ${hhmm(ts)}`));
 
   // Context under the header: what this replies to, which app command produced it.
   const context: string[] = [];

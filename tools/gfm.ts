@@ -35,6 +35,9 @@ export function escapeText(s: string, lineStart = false): string {
   return out;
 }
 
+/** Escapes text for use inside raw HTML (where GFM doesn't apply Markdown). */
+export const escapeHtml = (s: string) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
 /** Escapes text that is shown as one line (names, titles, snippets): newlines become spaces. */
 export const escapeLine = (s: string) => escapeText(String(s ?? "").replace(/\s*\n\s*/g, " "));
 
