@@ -16,6 +16,11 @@ export interface GuildConfig {
   backfill: boolean;
   /** Send a repository_dispatch ("archive-updated") after commits, for the Pages workflow. */
   pages: boolean;
+  /**
+   * Archive private threads the bot is in. Off by default: anyone in a private thread can add the
+   * bot by mentioning it, which would otherwise publish the whole thread.
+   */
+  privateThreads: boolean;
 }
 
 export interface Config {
@@ -67,7 +72,7 @@ export function parseConfig(raw: string | undefined): Config {
     if (path.split("/").some((seg) => seg === "." || seg === "..")) throw new ConfigError(`${where}.path is invalid`);
     const channels = g.channels === "all" ? "all" : snowflakes(g.channels, `${where}.channels`);
     const exclude = g.exclude === undefined ? [] : snowflakes(g.exclude, `${where}.exclude`);
-    guilds.set(guildId, { guildId, repo: g.repo, branch, path, channels, exclude, backfill: g.backfill ?? true, pages: g.pages === true });
+    guilds.set(guildId, { guildId, repo: g.repo, branch, path, channels, exclude, backfill: g.backfill ?? true, pages: g.pages === true, privateThreads: g.privateThreads === true });
   }
   const num = (v: unknown, dflt: number, name: string) => {
     if (v === undefined) return dflt;

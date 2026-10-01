@@ -13,6 +13,7 @@ export interface ChannelInfo {
 }
 
 export const CHANNEL_TYPE_CATEGORY = 4;
+export const CHANNEL_TYPE_PRIVATE_THREAD = 12;
 /** Channels the bot can't view arrive with this flag (from 2026-11-16) and must be ignored. */
 export const CHANNEL_FLAG_OBFUSCATED = 1 << 17;
 const THREAD_TYPES = new Set([10, 11, 12]);
@@ -47,6 +48,7 @@ export function isArchived(id: string, channels: ReadonlyMap<string, ChannelInfo
   // Channels the bot can't view are never archived (their names and topics would leak otherwise).
   // A thread is visible exactly when its parent is.
   if (ch.hidden || (isThread(ch) && ch.parentId && channels.get(ch.parentId)?.hidden)) return false;
+  if (ch.type === CHANNEL_TYPE_PRIVATE_THREAD && !cfg.privateThreads) return false;
   if (chain.some((c) => cfg.exclude.includes(c))) return false;
   if (cfg.channels === "all") return true;
   return chain.some((c) => (cfg.channels as string[]).includes(c));
@@ -94,9 +96,19 @@ function bits(v: unknown): bigint {
  * Discord's order: base permissions from @everyone and the bot's roles (administrator sees all),
  * then the channel's @everyone overwrite, its role overwrites combined, then the bot's own.
  */
-export function canView(overwrites: unknown, p: PermissionContext): boolean {
+function basePermissions(p: PermissionContext): bigint {
   let base = bits(p.roles[p.guildId]);
   for (const r of p.memberRoles) base |= bits(p.roles[r]);
+  return base;
+}
+
+/** Whether the bot has Administrator (it can then view every channel, whatever the overwrites). */
+export function isAdministrator(p: PermissionContext | null): boolean {
+  return !!p && (basePermissions(p) & ADMINISTRATOR) !== 0n;
+}
+
+export function canView(overwrites: unknown, p: PermissionContext): boolean {
+  const base = basePermissions(p);
   if (base & ADMINISTRATOR) return true;
   const list = (Array.isArray(overwrites) ? overwrites : []) as { id: string; type: number | string; allow: string; deny: string }[];
   const isRole = (o: { type: number | string }) => o.type === 0 || o.type === "role";

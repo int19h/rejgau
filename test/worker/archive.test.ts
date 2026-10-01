@@ -108,7 +108,7 @@ describe("GuildArchive", () => {
     // The empty repo got seeded, the archive branch created, and nothing leaked.
     expect(github.files("main")["README.md"]).toContain("rejgau");
     const files = github.files("archive");
-    expect(JSON.parse(files["archive.json"])).toMatchObject({ format: 1, guild_id: "101" });
+    expect(JSON.parse(files["archive.json"])).toMatchObject({ format: 2, guild_id: "101" });
     const all = Object.values(files).join("\n");
     for (const secret of ["secret stuff", "excluded stuff", "other-secret", "excluded-secret", "leaky", '"members"']) expect(all).not.toContain(secret);
 

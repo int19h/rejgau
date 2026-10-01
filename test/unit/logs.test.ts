@@ -108,3 +108,46 @@ describe("threads", () => {
     expect(files.get(`general/2026/09/29/topic-${T2}.md`)).toContain("[2026-09-30 →](../30/topic.md)");
   });
 });
+
+describe("hostile names", () => {
+  const T = "1554541602075316300";
+  const files = buildLogs(
+    fold([
+      line("CHANNEL_SELECTED", { channel: { id: "11", name: "README.md", type: 0 } }, 0, "rejgau"),
+      line("CHANNEL_SELECTED", { channel: { id: T, name: "Q&A :)", type: 11, parent_id: "11" } }, 1, "rejgau"),
+      line("MESSAGE_CREATE", M(ID1, "11", { author: { id: "8", username: "x", global_name: "Mallory\n\n# INJECTED [click](https://evil.example)" } }), 2),
+      line("MESSAGE_CREATE", M("1554541602075316400", T), 3),
+    ]),
+  );
+
+  it("can't take the index's name", () => {
+    expect(files.get("README.md")).toContain("# Archive");
+    expect(files.get("README.md-11/README.md")).toBeDefined();
+  });
+
+  it("stay on one line inside header HTML", () => {
+    const day = files.get("README.md-11/2026/09/29.md")!;
+    expect(day).toContain("<tt><b>Mallory # INJECTED [click](https://evil.example)</b> · 17:13</tt>");
+    expect(day).not.toMatch(/^# INJECTED/m);
+  });
+
+  it("are fully percent-encoded in links", () => {
+    expect(files.get("README.md-11/2026/09/29.md")).toContain("(29/Q%26A--%29.md)");
+  });
+});
+
+describe("orphaned threads", () => {
+  it("aren't published once their parent is unselected", () => {
+    const T = "1554541602075316300";
+    const files = buildLogs(
+      fold([
+        line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+        line("CHANNEL_SELECTED", { channel: { id: T, name: "a thread", type: 11, parent_id: "11" } }, 1, "rejgau"),
+        line("MESSAGE_CREATE", M("1554541602075316400", T), 2),
+        line("THREAD_DELETE", { id: T, parent_id: "11", type: 11 }, 3),
+        line("CHANNEL_UNSELECTED", { id: "11" }, 4, "rejgau"),
+      ]),
+    );
+    expect([...files.keys()]).toEqual(["README.md"]);
+  });
+});

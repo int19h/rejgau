@@ -10,7 +10,7 @@
 // rewrites never have to be reconciled with bot-owned state files.
 
 import { DurableObject } from "cloudflare:workers";
-import { canView, isArchived, isThread, lineScope, publishedChannelIds, type ChannelInfo, type PermissionContext } from "./channels";
+import { canView, isAdministrator, isArchived, isThread, lineScope, publishedChannelIds, type ChannelInfo, type PermissionContext } from "./channels";
 import { parseConfig, type Config, type GuildConfig } from "./config";
 import { discordGet, DiscordError } from "./discord";
 import type { Env, OutboxEvent } from "./env";
@@ -33,8 +33,13 @@ const GUILD_EVENTS = new Set([
 
 const CHANNEL_EVENTS = new Set(["CHANNEL_CREATE", "CHANNEL_UPDATE", "CHANNEL_DELETE", "THREAD_CREATE", "THREAD_UPDATE", "THREAD_DELETE"]);
 
-/** How often the bot's own roles are re-read: changes to them aren't sent without the members intent. */
+/**
+ * How often role permissions and the bot's own roles are re-read over REST: a safety net, since
+ * GUILD_CREATE, role events and the bot's own GUILD_MEMBER_UPDATE normally keep them current.
+ */
 const PERMISSION_REFRESH_MS = 60 * 60_000;
+/** After a failed refresh (with permissions already known), wait this long before trying again. */
+const PERMISSION_RETRY_MS = 5 * 60_000;
 
 const MAX_FLUSH_PATHS = 40;
 const MAX_FLUSH_BYTES = 8 * 1024 * 1024;
@@ -250,6 +255,22 @@ export class GuildArchive extends DurableObject<Env> {
     return this.setPermissions(roles, me.roles ?? []);
   }
 
+  /**
+   * refreshPermissions, but while permissions are known a failure keeps them (it's logged and the
+   * refresh retried later) instead of holding up or failing events. Without them it throws.
+   */
+  private async ensurePermissions(guildId: string, force = false): Promise<boolean> {
+    if (!force && this.permissions() && Date.now() < Number(this.get("permRetryAt") ?? "0")) return false;
+    try {
+      return await this.refreshPermissions(guildId, force);
+    } catch (e) {
+      if (!this.permissions()) throw e;
+      log("permission_refresh_failed", { error: errorMessage(e) });
+      this.set("permRetryAt", String(Date.now() + PERMISSION_RETRY_MS));
+      return false;
+    }
+  }
+
   private markDeleted(id: string): void {
     this.sql.exec(`UPDATE channels SET deleted = 1 WHERE id = ?`, id);
     const info = this.channels.get(id);
@@ -266,6 +287,8 @@ export class GuildArchive extends DurableObject<Env> {
    * carry its time (`at`), so they file and sort with it.
    */
   private reconcile(guild: GuildConfig, opts: { at?: number; backfillThreads?: boolean; liveCreated?: string } = {}): void {
+    // Until the bot's permissions are known every channel counts as hidden; don't let that unselect anything.
+    if (!this.permissions()) return;
     for (const [id, info] of this.channels) {
       if (info.deleted) continue;
       const now = isArchived(id, this.channels, guild) ? 1 : 0;
@@ -366,10 +389,17 @@ export class GuildArchive extends DurableObject<Env> {
     const conf = this.guildConfig();
     if (!conf) return { handled: events.length }; // guild removed from config: drop
     const { guild } = conf;
+    // Permissions first, so a config change below is evaluated against them.
+    try {
+      if ((await this.ensurePermissions(guildId)) && this.get("initialized")) this.reconcile(guild);
+    } catch (e) {
+      // Not knowing them isn't any event's fault: have the whole batch retried.
+      log("permissions_unknown", { error: errorMessage(e) });
+      return { handled: 0, failed: { retryable: true, error: `permissions unknown: ${errorMessage(e).slice(0, 400)}` } };
+    }
     this.checkConfigChange(guild);
     let handled = 0;
     try {
-      if ((await this.refreshPermissions(guildId)) && this.get("initialized")) this.reconcile(guild);
       for (const ev of events) {
         const marker = ev.t.startsWith("SESSION_");
         // Replayed after a resume or pump retry (read fresh each time: calls may have overlapped).
@@ -419,11 +449,11 @@ export class GuildArchive extends DurableObject<Env> {
 
   /** Records config changes that affect this guild and reconciles channel selection. */
   private checkConfigChange(guild: GuildConfig): void {
-    const sig = JSON.stringify({ repo: guild.repo, branch: guild.branch, path: guild.path, channels: guild.channels, exclude: guild.exclude, backfill: guild.backfill });
+    const sig = JSON.stringify({ repo: guild.repo, branch: guild.branch, path: guild.path, channels: guild.channels, exclude: guild.exclude, backfill: guild.backfill, privateThreads: guild.privateThreads });
     if (sig === this.get("configSig")) return;
     this.set("configSig", sig);
     // Excluded channel IDs are left out: they'd only reveal channels that aren't archived.
-    this.synthetic(guild, "CONFIG", { channels: guild.channels, excluded: guild.exclude.length, backfill: guild.backfill });
+    this.synthetic(guild, "CONFIG", { channels: guild.channels, excluded: guild.exclude.length, backfill: guild.backfill, private_threads: guild.privateThreads });
     if (this.get("initialized")) this.reconcile(guild);
   }
 
@@ -486,7 +516,9 @@ export class GuildArchive extends DurableObject<Env> {
       // the bot is added to an existing private thread; then `newly_created` is absent.)
       const live = ev.t === "CHANNEL_CREATE" || (ev.t === "THREAD_CREATE" && d.newly_created);
       this.reconcile(guild, { at: ev.at, liveCreated: live ? d.id : undefined });
-      if (publishedBefore || publishedChannelIds(this.channels, guild).has(d.id)) this.emit(guild, gw, ev.d);
+      // An update that hides the channel from the bot isn't logged: it may carry a new name or topic.
+      const hiddenNow = !!this.channels.get(d.id)?.hidden;
+      if (publishedChannelIds(this.channels, guild).has(d.id) || (publishedBefore && !hiddenNow)) this.emit(guild, gw, ev.d);
       return;
     }
 
@@ -505,6 +537,11 @@ export class GuildArchive extends DurableObject<Env> {
     // Everything else is channel-scoped: messages, reactions, polls, pins, …
     const channelId: string | undefined = d.channel_id;
     if (!channelId) return;
+    if (this.channels.get(channelId)?.hidden && Date.now() - Number(this.get("permForcedAt") ?? "0") > 60_000) {
+      // Discord only sends events from channels the bot can view: the stored permissions are stale.
+      this.set("permForcedAt", String(Date.now()));
+      if (await this.ensurePermissions(this.get("guildId")!, true)) this.reconcile(guild, { at: ev.at });
+    }
     if (await this.resolveChannel(channelId)) this.reconcile(guild, { at: ev.at }); // newly learned channels may be selected
     if (!this.isSelected(channelId)) return;
     this.emit(guild, gw, ev.d);
@@ -740,7 +777,8 @@ export class GuildArchive extends DurableObject<Env> {
     if (!row) return;
     try {
       const result = await this.storeMedia(cfg, guild, row);
-      this.synthetic(guild, result.ok ? "MEDIA_STORED" : "MEDIA_FAILED", result.record);
+      // Attachments carry their channel, so their records are filed (and removable) with it.
+      this.synthetic(guild, result.ok ? "MEDIA_STORED" : "MEDIA_FAILED", { ...result.record, ...(row.channel_id ? { channel_id: row.channel_id } : {}) });
       this.sql.exec(`UPDATE media SET status = ? WHERE key = ?`, result.ok ? "done" : "failed", row.key);
     } catch (e) {
       if (e instanceof GitHubError && (e.retryAfterMs !== null || e instanceof GitHubAuthError)) {
@@ -755,7 +793,7 @@ export class GuildArchive extends DurableObject<Env> {
       const attempts = row.attempts + 1;
       log("media_error", { key: row.key, attempts, error: errorMessage(e) });
       if (attempts >= MEDIA_MAX_ATTEMPTS) {
-        this.synthetic(guild, "MEDIA_FAILED", { key: row.key, reason: errorMessage(e).slice(0, 200) });
+        this.synthetic(guild, "MEDIA_FAILED", { key: row.key, reason: errorMessage(e).slice(0, 200), ...(row.channel_id ? { channel_id: row.channel_id } : {}) });
         this.sql.exec(`UPDATE media SET status = 'failed', attempts = ? WHERE key = ?`, attempts, row.key);
       } else {
         this.sql.exec(`UPDATE media SET attempts = ?, next_at = ? WHERE key = ?`, attempts, Date.now() + 60_000 * 2 ** attempts, row.key);
@@ -905,7 +943,7 @@ export class GuildArchive extends DurableObject<Env> {
         const archiveJsonKey = `archiveJson:${guild.repo}:${guild.branch}:${guild.path}`;
         const writeArchiveJson = !head || (!this.get(archiveJsonKey) && !(await gh.readFile(archiveJson, head)));
         if (writeArchiveJson) {
-          files.push({ path: archiveJson, content: JSON.stringify({ format: 1, guild_id: this.get("guildId"), generator: "rejgau" }, null, 2) + "\n" });
+          files.push({ path: archiveJson, content: JSON.stringify({ format: 2, guild_id: this.get("guildId"), generator: "rejgau" }, null, 2) + "\n" });
         }
         try {
           sha = await gh.commit(guild.branch, head, files, `Archive ${taken} event${taken === 1 ? "" : "s"}`);
@@ -957,6 +995,7 @@ export class GuildArchive extends DurableObject<Env> {
       githubBackoffUntil: this.get("githubBackoffUntil") ? new Date(Number(this.get("githubBackoffUntil"))).toISOString() : null,
       bootstrapError: this.get("bootstrapError"),
       permissionsKnown: this.permissions() !== null,
+      administrator: isAdministrator(this.permissions()),
       hiddenChannels: [...this.channels.values()].filter((c) => c.hidden && !c.deleted && c.type !== 4).length,
     };
   }
@@ -990,6 +1029,8 @@ export class GuildArchive extends DurableObject<Env> {
    * event bootstraps and backfills from scratch. For test setups; already-uploaded media is reused.
    */
   async reset(): Promise<void> {
+    // Let an in-flight ingest finish first, so nothing it acknowledged is silently wiped mid-way.
+    await this.ingestChain.catch(() => {});
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
     // abort() discards writes not yet confirmed on disk, so wait for the wipe before restarting.
@@ -1007,8 +1048,8 @@ export class GuildArchive extends DurableObject<Env> {
       const conf = this.guildConfig();
       if (!conf) return { started: false, error: "guild not configured" };
       try {
+        if ((await this.ensurePermissions(guildId, true)) && this.get("initialized")) this.reconcile(conf.guild);
         this.checkConfigChange(conf.guild);
-        if ((await this.refreshPermissions(guildId, true)) && this.get("initialized")) this.reconcile(conf.guild);
         if (!this.get("initialized") && !(await this.tryBootstrap(conf.guild, guildId))) {
           return { started: false, error: this.get("bootstrapError") ?? "bootstrap failed recently; the next event retries" };
         }
@@ -1055,6 +1096,8 @@ export interface GuildStatus {
   bootstrapError: string | null;
   /** Whether the bot's permissions are known (until they are, no channel is archived). */
   permissionsKnown: boolean;
+  /** The bot has Administrator, so it can view every channel and denies don't keep any out. */
+  administrator: boolean;
   /** Channels (not threads) the bot can't view, which are never archived. */
   hiddenChannels: number;
 }

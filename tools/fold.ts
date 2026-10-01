@@ -96,6 +96,18 @@ export function orderLines(lines: RawLine[]): RawLine[] {
     .map((x) => x.l);
 }
 
+const THREAD_TYPES = new Set([10, 11, 12]);
+
+/**
+ * Whether a channel's messages are published: it's selected and, for a thread, so is its parent. (A
+ * deleted thread is never unselected, so it could outlive its parent's selection otherwise.)
+ */
+export function isPublished(state: ArchiveState, id: string): boolean {
+  const ch = state.channels.get(id);
+  if (!ch?.selected) return false;
+  return !THREAD_TYPES.has(ch.c.type) || !!state.channels.get(ch.c.parent_id)?.selected;
+}
+
 export function emptyState(): ArchiveState {
   return { guild: {}, channels: new Map(), messages: new Map(), memberSnapshots: new Map(), media: new Map(), reactors: new Map() };
 }

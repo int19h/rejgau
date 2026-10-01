@@ -1,7 +1,7 @@
 // Turns folded archive state into the reader's data files. Pure: returns path → JSON value.
 
 import { avatarRef, emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "../src/media";
-import { tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { normalizeText } from "../reader/src/text";
 
 /** How a person appeared on one message: the author (or invoker, mentioned user…) as logged then. */
@@ -180,7 +180,7 @@ function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set
 
   // A message that started a thread (or a forum post, whose id is the thread id).
   const threadId = m.thread?.id ?? (state.channels.has(m.id) && m.channel_id !== m.id ? m.id : undefined);
-  if (threadId && state.channels.get(threadId)?.selected) {
+  if (threadId && isPublished(state, threadId)) {
     out.thread = { id: threadId, name: state.channels.get(threadId)!.c.name ?? m.thread?.name, count: ctx.threadCounts.get(threadId) ?? 0 };
   }
 
@@ -229,7 +229,7 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
   const byFile = new Map<string, MessageState[]>();
   const threadCounts = new Map<string, number>();
   for (const ms of state.messages.values()) {
-    if (!state.channels.get(ms.channelId)?.selected) continue;
+    if (!isPublished(state, ms.channelId)) continue;
     const key = `${ms.channelId}/${monthOf(ms.m.id)}`;
     if (!byFile.has(key)) byFile.set(key, []);
     byFile.get(key)!.push(ms);
@@ -294,7 +294,7 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
     };
     include(c.parent_id, depth + 1);
   };
-  for (const [id, ch] of state.channels) if (ch.selected) include(id);
+  for (const id of state.channels.keys()) if (isPublished(state, id)) include(id);
 
   // People seen only reacting still need names for reaction tooltips.
   for (const [id, r] of state.reactors) {

@@ -10,7 +10,7 @@ const channels = new Map<string, ChannelInfo>([
   ch("20", 4), ch("21", 0, "20"), ch("30", 0, null, CHANNEL_FLAG_OBFUSCATED),
 ]);
 const cfg = (channels: GuildConfig["channels"], exclude: string[] = []): GuildConfig => ({
-  guildId: "1", repo: "o/r", branch: "archive", path: "", channels, exclude, backfill: true, pages: false,
+  guildId: "1", repo: "o/r", branch: "archive", path: "", channels, exclude, backfill: true, pages: false, privateThreads: false,
 });
 
 describe("isArchived", () => {
@@ -119,5 +119,18 @@ describe("lineScope", () => {
     expect(lineScope("MEMBER_SNAPSHOT", { user_id: "7" })).toBe("guild");
     // Never a path from untrusted input.
     expect(lineScope("MESSAGE_CREATE", { channel_id: "../../x" })).toBe("guild");
+  });
+});
+
+describe("private threads", () => {
+  it("are only archived with privateThreads: true (anyone in one could add the bot)", () => {
+    const channels = new Map<string, ChannelInfo>([
+      ["10", { id: "10", type: 0, parentId: null, flags: 0, deleted: false, hidden: false }],
+      ["11", { id: "11", type: 12, parentId: "10", flags: 0, deleted: false, hidden: false }],
+      ["12", { id: "12", type: 11, parentId: "10", flags: 0, deleted: false, hidden: false }],
+    ]);
+    expect(isArchived("11", channels, cfg("all"))).toBe(false);
+    expect(isArchived("12", channels, cfg("all"))).toBe(true);
+    expect(isArchived("11", channels, { ...cfg("all"), privateThreads: true })).toBe(true);
   });
 });

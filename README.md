@@ -11,7 +11,7 @@ Status: the bot (phase 1) and the static reader with search (phase 2) are both i
 On the archive branch (default `archive`), under the configured folder:
 
 ```
-archive.json                   format marker: {"format": 1, "guild_id": …}
+archive.json                   format marker: {"format": 2, "guild_id": …} (format 1: one raw/YYYY/MM/DD.jsonl per day)
 raw/YYYY/MM/DD/<channel>.jsonl one JSON object per line: a UTC day of one channel or thread (by ID)
 raw/YYYY/MM/DD/guild.jsonl     the same day's server-wide records: snapshots, roles, emoji, members, media, sessions, config
 ```
@@ -140,7 +140,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://rejgau.<your-subdomai
       "channels": ["<category or channel id>", "…"],
       "exclude": ["<channel id>"],
       "backfill": true,
-      "pages": false
+      "pages": false,
+      "privateThreads": false
     }
   },
   "flushIdleSeconds": 120,
@@ -150,7 +151,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://rejgau.<your-subdomai
 }
 ```
 
-- **`channels`**: `"all"` (every channel the bot can see), or a list of channel and/or category IDs. A category covers its current and future channels. Threads and forum posts follow their parent. Either way, a channel the bot can't view is never selected or named in the archive: the bot works out its View Channel permission from its roles and the channel's permission overwrites, and re-checks when roles or channels change (and its own roles hourly). Denying the bot's role View Channel on a channel is therefore enough to keep it out.
+- **`channels`**: `"all"` (every channel the bot can see), or a list of channel and/or category IDs. A category covers its current and future channels. Threads and forum posts follow their parent. Either way, a channel the bot can't view is never selected or named in the archive: the bot works out its View Channel permission from its roles and the channel's permission overwrites, and re-checks when roles, channels or its own roles change (and over REST hourly). Denying the bot View Channel on a channel therefore keeps it out, **unless the bot has Administrator** (it then sees every channel; `/status` shows `administrator`), or another of its roles, or an overwrite for the bot itself, allows it.
+- **`privateThreads`**: archive private threads the bot is in. Off by default, because anyone in a private thread can add the bot to it by mentioning it, which would publish the whole thread. (A bot with Manage Threads also sees every private thread.)
 - **`exclude`**: IDs to skip. These take precedence, and apply to descendants too.
 - **`backfill`**: when a channel becomes selected, fetch its whole history. Active threads are included; archived threads aren't yet.
 - **`pages`**: after commits, send a `repository_dispatch` (`archive-updated`) to the archive repo, at most once per 10 minutes, so the Pages workflow republishes the reader.
@@ -179,7 +181,7 @@ Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized reques
 
 Deletion is manual, by the archive admin:
 1. `POST /pause`, then `POST /flush`, in that order, so nothing is in flight and nothing new gets committed.
-2. Rewrite the `archive` branch however you like (e.g. `git filter-repo`), and force-push. To drop a whole channel: `git filter-repo --path-glob 'raw/*/*/*/<channel id>.jsonl' --invert-paths` (its threads have their own IDs).
+2. Rewrite the `archive` branch however you like (e.g. `git filter-repo`), and force-push. To drop a whole channel: `git filter-repo --path-glob 'raw/*/*/*/<channel id>.jsonl' --invert-paths`, and the same for each of its threads (they have their own IDs). Some traces stay in `guild.jsonl` and need editing by hand: `THREAD_LIST_SYNC` events (thread objects, including names), `CATCHUP_BEGIN` records (channel IDs), and media records for emoji and avatars seen there. Attachment media records are filed with their channel.
 3. Delete the matching release assets.
 4. `POST /resume`.
 
@@ -233,7 +235,8 @@ Each message starts with a centred header line that links to itself (`…/30.md#
 To render locally: `npm run build:logs -- --archive ../my-archive --out logs`.
 
 Rendering choices (GitHub strips styles, scripts, video and audio):
-- user text is escaped, so it can't inject HTML or Markdown structure;
+- user text is escaped, to keep it from injecting HTML or Markdown structure;
+- deleted messages and earlier versions of edited ones are shown, as in the reader (the archive keeps them);
 - spoilers fold the whole message into a `<details>` block;
 - custom emoji show as `:name:`, and video, audio and voice messages as links;
 - times are UTC.

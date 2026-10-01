@@ -4,7 +4,7 @@ import { ConfigError, parseConfig } from "../../src/config";
 describe("parseConfig", () => {
   it("applies defaults", () => {
     const cfg = parseConfig(JSON.stringify({ guilds: { "123": { repo: "o/r", channels: "all" } } }));
-    expect(cfg.guilds.get("123")).toEqual({ guildId: "123", repo: "o/r", branch: "archive", path: "", channels: "all", exclude: [], backfill: true, pages: false });
+    expect(cfg.guilds.get("123")).toEqual({ guildId: "123", repo: "o/r", branch: "archive", path: "", channels: "all", exclude: [], backfill: true, pages: false, privateThreads: false });
     expect(cfg.flushIdleMs).toBe(120_000);
     expect(cfg.flushMaxMs).toBe(600_000);
     expect(cfg.maxMediaBytes).toBe(100 * 1024 * 1024);
