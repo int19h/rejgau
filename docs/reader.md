@@ -8,7 +8,7 @@ This covers the static reader for rejgau archives, plus the build step that turn
   - a channel list (categories, channels, threads);
   - messages grouped by author, as Discord does;
   - Discord markdown, embeds, attachments, components, polls, stickers, reactions, replies, forwards, and app-command headers;
-  - edit history and deleted-message badges.
+  - only current versions: deleted messages and earlier versions of edited ones are left out (they stay in `raw/`).
 - **Search with Discord's syntax** (`from:`, `in:`, `has:`, `before:`, `after:`, `during:`, `mentions:`, `pinned:`, `authorType:`, `-` negation, `"phrases"`). Anything else is plain text.
 - **Static hosting only:** GitHub Pages, deployed by an Action in the archive repo, or any static server for a local build.
   - There is no `?data=<url>` loading of third-party data. Pages origins (`<owner>.github.io`) are shared by all of an owner's project sites, so a rendering bug fed arbitrary input would be XSS there.
@@ -104,7 +104,7 @@ data/search/<YYYY-MM>.json     compact search rows for all channels:
 data/c/<channel>/<YYYY-MM>.json
   { media: { <key>: url | null },          only keys referenced in this file (resolved at build time)
     users: { <snapKey>: {id, username, global_name, avatar, nick, roles, bot, …} },
-    messages: [ { id, ts, type, flags, author: <snapKey>, content, edits?, deleted_at?,
+    messages: [ { id, ts, type, flags, author: <snapKey>, content,
                   edited_at?, attachments, embeds, components, sticker_items, poll?, votes?,
                   reactions?: [{emoji, count, users?}], reference?, referenced?: {id, author, excerpt},
                   snapshots?, interaction?: {name, user: <snapKey>, type, command_type}, thread?,
@@ -154,7 +154,7 @@ data/c/<channel>/<YYYY-MM>.json
   - the display name: nickname > global_name > username, coloured by the highest coloured role;
   - BOT/APP tags;
   - a timestamp with the full date on hover.
-  - "(edited)" opens the edit history; a "deleted" badge appears when applicable.
+  - "(edited)" marks edited messages; a reply to a deleted message shows "Original message was deleted".
 - **Replies:** a compact line above the message ("↪ @name excerpt"), linking to the referenced message.
 - **App commands:** the header line "@user used /name". The command name comes from `interaction_metadata.name` or `interaction.name`. User-installed apps are marked "(user app)".
 - **Content:** Discord markdown:
@@ -201,7 +201,7 @@ data/c/<channel>/<YYYY-MM>.json
   - Substring matching is a deliberate superset of Discord's word matching.
   - `from:` and `mentions:` match any name the user ever had.
   - `before:`, `after:` and `during:` use the viewer's time zone, as Discord does. `before` and `after` exclude the named day.
-  - Deleted messages appear in results with a badge.
+  - Deleted messages aren't in the data, so they never appear in results.
 - **Execution:**
   - The page (not a Web Worker: at this volume the scan is fast) loads `search/<YYYY-MM>.json` files newest-first, pruned by the date filters (widened by ±1 day for time zones).
   - Results stream in as they're found, capped at 500 with "load more".
@@ -238,5 +238,5 @@ data/c/<channel>/<YYYY-MM>.json
 
 ## Open questions
 
-- Deleted messages are shown with a "deleted" badge by default. Should a build flag hide them instead?
+- Deleted messages and earlier versions of edited ones are not published (decided before launch); `raw/` keeps them.
 - Should the reader show a per-message "view raw JSON" for power users? It's cheap to add.

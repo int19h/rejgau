@@ -12,7 +12,7 @@
 import { posix } from "node:path";
 import { refForUrl, stickerRef } from "../src/media";
 import { MESSAGE_CHANNEL_TYPES, NORMAL_TYPES, SYSTEM_TEXT, THREAD_TYPES } from "../reader/src/data";
-import { isPublished, tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, previewText, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { customEmoji, escapeHtml, escapeLine, escapeText, inlineCode, link, linkUrl, paragraphs, quote, renderMarkdown, type GfmContext } from "./gfm";
 
 const DISCORD_EPOCH = 1420070400000n;
@@ -88,7 +88,8 @@ interface Layout {
 function layout(state: ArchiveState): Layout {
   const messages = new Map<string, MessageState[]>();
   for (const ms of state.messages.values()) {
-    if (!isPublished(state, ms.channelId)) continue;
+    // Deleted messages (and earlier versions of edited ones) stay in raw/ but aren't published.
+    if (!isPublished(state, ms.channelId) || ms.deletedAt) continue;
     if (!messages.has(ms.channelId)) messages.set(ms.channelId, []);
     messages.get(ms.channelId)!.push(ms);
   }
@@ -162,7 +163,7 @@ function messageFile(l: Layout, channelId: string, messageId: string): string | 
 
 /** Where a message is rendered: file path plus anchor, if it's in the logs. */
 function messageHref(env: Env, channelId: string | undefined, messageId: string | undefined): string | null {
-  if (!channelId || !messageId || !env.state.messages.has(messageId)) return null;
+  if (!channelId || !messageId || !env.state.messages.has(messageId) || env.state.messages.get(messageId)!.deletedAt) return null;
   const file = messageFile(env.layout, channelId, messageId);
   return file ? `${relLink(env.file, file)}#m${messageId}` : null;
 }
@@ -394,7 +395,6 @@ function renderMessage(env: Env, ms: MessageState): string {
       if (href) text = `pinned <a href="${escapeHtml(href)}">a message</a> to this channel.`;
     }
     out.push(`<p align="center"><tt>→ ${name} ${text} · <a id="m${m.id}" href="#m${m.id}">${hhmm(ts)}</a></tt></p>`);
-    if (ms.deletedAt) out.push(`<sub>🗑 deleted ${dateTime(ms.deletedAt)} UTC</sub>`);
     return out.join("\n\n");
   }
 
@@ -403,9 +403,11 @@ function renderMessage(env: Env, ms: MessageState): string {
 
   // Context under the header: what this replies to, which app command produced it.
   const context: string[] = [];
-  const ref = m.referenced_message ?? (m.type === 21 && m.message_reference?.message_id ? env.state.messages.get(m.message_reference.message_id)?.m : undefined);
-  if (ref?.id) {
-    const snippet = String(ref.content ?? "").replace(/\s+/g, " ").slice(0, 100) || (ref.attachments?.length ? "attachment" : ref.embeds?.length ? "embed" : "message");
+  const ref = referencedMessage(env.state, m);
+  if (ref === "deleted") {
+    context.push("> ↪ replying to a deleted message");
+  } else if (ref?.id) {
+    const snippet = previewText(ref.content, 100) || (ref.attachments?.length ? "attachment" : ref.embeds?.length ? "embed" : "message");
     const href = messageHref(env, ref.channel_id ?? m.channel_id, ref.id);
     context.push(`> ↪ replying to **${escapeLine(displayName(ref.author))}**: ${href ? `[${escapeLine(snippet)}](${href})` : escapeLine(snippet)}`);
   } else if (m.message_reference?.message_id && m.type === 19) {
@@ -432,17 +434,8 @@ function renderMessage(env: Env, ms: MessageState): string {
     out.push(quote(inner));
   }
 
-  const meta: string[] = [];
-  if (m.edited_timestamp) meta.push(`edited ${dateTime(m.edited_timestamp)} UTC`);
-  if (ms.deletedAt) meta.push(`🗑 deleted ${dateTime(ms.deletedAt)} UTC`);
-  if (meta.length) out.push(`<sub>${meta.join(" · ")}</sub>`);
-  if (ms.edits.length) {
-    const versions = ms.edits.map((e) => {
-      const eb = body(env, { ...e, flags: m.flags }, ctx);
-      return [`*Version from ${dateTime(e.ts ?? ts)} UTC:*`, wrapSpoiler(eb) || "*(empty)*"].join("\n\n");
-    });
-    out.push(`<details><summary>${plural(ms.edits.length, "earlier version")}</summary>\n\n${versions.join("\n\n---\n\n")}\n\n</details>`);
-  }
+  // Only the current version is shown; earlier ones stay in raw/.
+  if (m.edited_timestamp) out.push(`<sub>edited ${dateTime(m.edited_timestamp)} UTC</sub>`);
 
   if (ms.reactions.size) {
     out.push(

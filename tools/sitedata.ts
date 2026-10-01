@@ -1,7 +1,7 @@
 // Turns folded archive state into the reader's data files. Pure: returns path → JSON value.
 
 import { avatarRef, emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "../src/media";
-import { isPublished, tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, previewText, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { normalizeText } from "../reader/src/text";
 
 /** How a person appeared on one message: the author (or invoker, mentioned user…) as logged then. */
@@ -131,8 +131,6 @@ function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set
     if (v === undefined || v === null || v === false || (Array.isArray(v) && v.length === 0)) continue;
     out[k] = v;
   }
-  if (ms.edits.length) out.edits = ms.edits;
-  if (ms.deletedAt) out.deleted_at = ms.deletedAt;
   if (ms.pinned) out.pinned = true;
   if (Array.isArray(m.mentions) && m.mentions.length) {
     out.mentions = m.mentions.map((u: any) => snaps.add(snapUser(u, u.member))).filter(Boolean);
@@ -151,14 +149,14 @@ function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set
   if (m.message_reference) out.reference = m.message_reference;
 
   // Reply preview, or for a thread's first message, the message it was started from.
-  let ref = m.referenced_message;
-  if (!ref?.id && m.type === 21 && m.message_reference?.message_id) ref = state.messages.get(m.message_reference.message_id)?.m;
-  if (ref?.id) {
+  const ref = referencedMessage(state, m);
+  if (ref === "deleted" || (!ref && m.type === 19 && m.message_reference?.message_id)) out.referenced = { deleted: true };
+  else if (ref?.id) {
     out.referenced = {
       id: ref.id,
       channel_id: ref.channel_id,
       author: snaps.add(snapUser(ref.author, null)),
-      content: String(ref.content ?? "").slice(0, 300),
+      content: previewText(ref.content, 300),
       ...(ref.attachments?.length ? { attachments: true } : {}),
       ...(ref.embeds?.length ? { embeds: true } : {}),
     };
@@ -188,7 +186,6 @@ function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set
   // Reactions folded from live events aren't in the message snapshot.
   for (const r of ms.reactions.values()) if (r.emoji?.id) media.add(emojiRef(r.emoji.id, !!r.emoji.animated).key);
   if (fallback?.avatar && m.author?.id) media.add(`gavatar-${ctx.guildId}-${m.author.id}-${fallback.avatar}.${String(fallback.avatar).startsWith("a_") ? "gif" : "png"}`);
-  for (const e of ms.edits) for (const r of mediaInMessage({ ...e, id: m.id, channel_id: m.channel_id }, ctx.guildId)) media.add(r.key);
   return out;
 }
 
@@ -229,7 +226,8 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
   const byFile = new Map<string, MessageState[]>();
   const threadCounts = new Map<string, number>();
   for (const ms of state.messages.values()) {
-    if (!isPublished(state, ms.channelId)) continue;
+    // Deleted messages (and earlier versions of edited ones) stay in raw/ but aren't published.
+    if (!isPublished(state, ms.channelId) || ms.deletedAt) continue;
     const key = `${ms.channelId}/${monthOf(ms.m.id)}`;
     if (!byFile.has(key)) byFile.set(key, []);
     byFile.get(key)!.push(ms);

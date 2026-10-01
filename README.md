@@ -236,7 +236,7 @@ To render locally: `npm run build:logs -- --archive ../my-archive --out logs`.
 
 Rendering choices (GitHub strips styles, scripts, video and audio):
 - user text is escaped, to keep it from injecting HTML or Markdown structure;
-- deleted messages and earlier versions of edited ones are shown, as in the reader (the archive keeps them);
+- deleted messages and earlier versions of edited ones aren't shown, here or in the reader; replies to a deleted message say so. They stay in `raw/`, which is public along with the rest of the repo (as are their media in the releases);
 - spoilers fold the whole message into a `<details>` block;
 - custom emoji show as `:name:`, and video, audio and voice messages as links;
 - times are UTC.

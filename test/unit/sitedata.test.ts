@@ -42,3 +42,23 @@ describe("buildSiteData", () => {
     expect(users.users["7"].names).toContain("u");
   });
 });
+
+describe("deleted and edited messages", () => {
+  it("are published only as their current, undeleted versions", () => {
+    const lines: RawLine[] = [
+      line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+      line("MESSAGE_CREATE", M(ID1, "11", { content: "regret this" }), 1),
+      line("MESSAGE_DELETE", { id: ID1, channel_id: "11" }, 2),
+      line("MESSAGE_CREATE", M(ID2, "11", { type: 19, content: "edited later", message_reference: { message_id: ID1 }, referenced_message: M(ID1, "11", { content: "regret this" }) }), 3),
+      line("MESSAGE_UPDATE", M(ID2, "11", { type: 19, content: "now this", edited_timestamp: "2026-09-01T00:00:10Z" }), 4),
+    ];
+    const { files } = buildSiteData(fold(lines), "2026-09-30T00:00:00Z");
+    const month: any = files.get("c/11/2026-09.json");
+    expect(month.messages.map((m: any) => m.id)).toEqual([ID2]);
+    expect(month.messages[0]).toMatchObject({ content: "now this", referenced: { deleted: true } });
+    expect(month.messages[0].edits).toBeUndefined();
+    const all = JSON.stringify([...files.values()]);
+    expect(all).not.toContain("regret this");
+    expect(all).not.toContain("edited later");
+  });
+});

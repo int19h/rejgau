@@ -10,6 +10,9 @@ const ID1 = "1554541602075316245";
 const ID2 = "1554541602075316246";
 const ID3 = "1554900000000000000";
 const THREAD = "1554541602075316300";
+const DELETED = "1554541602075316247";
+const REPLY_TO_EDITED = "1554541602075316248";
+const REPLY_TO_DELETED = "1554541602075316249";
 
 const lines: RawLine[] = [
   line("GUILD_SNAPSHOT", { id: "g", name: "Guild <b>", roles: [] }, 0, "rejgau"),
@@ -21,7 +24,11 @@ const lines: RawLine[] = [
   line("MESSAGE_CREATE", M(ID2, "11", { type: 19, content: "a reply", message_reference: { message_id: ID1, channel_id: "11" }, referenced_message: M(ID1, "11", { content: "hello" }) }), 6),
   line("MESSAGE_UPDATE", M(ID2, "11", { type: 19, content: "a reply, edited", edited_timestamp: "2026-09-29T12:00:00Z" }), 7),
   line("MESSAGE_CREATE", M(ID3, "11", { thread: { id: THREAD, name: "a thread" } }), 8),
-  line("MESSAGE_DELETE", { id: ID3, channel_id: "11" }, 9),
+  line("MESSAGE_CREATE", M(DELETED, "11", { content: "regret this" }), 8),
+  line("MESSAGE_DELETE", { id: DELETED, channel_id: "11" }, 9),
+  // Replies embed the message they reply to as it was then.
+  line("MESSAGE_CREATE", M(REPLY_TO_EDITED, "11", { type: 19, message_reference: { message_id: ID2 }, referenced_message: M(ID2, "11", { content: "a reply" }) }), 9),
+  line("MESSAGE_CREATE", M(REPLY_TO_DELETED, "11", { type: 19, message_reference: { message_id: DELETED }, referenced_message: M(DELETED, "11", { content: "regret this" }) }), 9),
   line("MESSAGE_CREATE", M("1554541602075316400", THREAD, { content: "in thread" }), 10),
   line("MESSAGE_CREATE", M("1554541602075316500", "12", { content: "voice chat" }), 11),
   line("MEDIA_STORED", { key: "att-3-p.png", url: "https://github.com/o/r/releases/download/media-2026-09/att-3-p.png" }, 12, "rejgau"),
@@ -42,7 +49,7 @@ describe("buildLogs", () => {
     const root = files.get("README.md")!;
     expect(root).toContain("# Guild \\<b\\>");
     expect(root).toContain("Rendered by rejgau from the raw logs (`archive@abc1234`).");
-    expect(root).toContain("## Text\n\n- [#general](general/README.md) · 3 messages");
+    expect(root).toContain("## Text\n\n- [#general](general/README.md) · 5 messages");
     expect(files.get("general/README.md")).toContain("- **a thread** · 1 message · [2026-09-29](2026/09/29/a-thread.md)");
     const thread = files.get("general/2026/09/29/a-thread.md")!;
     expect(thread).toContain("# 🧵 a thread · 2026-09-29\n\n<sub>thread started 2026-09-29 17:13 UTC · times are UTC</sub>\n\n[#general](../29.md)");
@@ -55,18 +62,24 @@ describe("buildLogs", () => {
     expect(day).toContain(`<p align="center"><a id="m${ID1}" href="#m${ID1}"><tt><b>Alice</b> · 17:13</tt></a></p>\n\n<details><summary>Spoiler</summary>\n\nhello ||secret||\n\n![p.png](<https://github.com/o/r/releases/download/media-2026-09/att-3-p.png>)\n\n</details>`);
   });
 
-  it("links replies to the original, and keeps earlier versions of edited messages", () => {
+  it("links replies to the original, showing only current versions", () => {
     const day = files.get("general/2026/09/29.md")!;
-    expect(day).toContain(`> ↪ replying to **Alice**: [hello](29.md#m${ID1})`);
+    // Previews show the current text, with spoilers masked.
+    expect(day).toContain(`> ↪ replying to **Alice**: [hello \\[spoiler\\]](29.md#m${ID1})`);
+    expect(day).toContain(`> ↪ replying to **Alice**: [a reply, edited](29.md#m${ID2})`);
     expect(day).toContain("<sub>edited 2026-09-29 12:00 UTC</sub>");
-    expect(day).toContain("<details><summary>1 earlier version</summary>");
-    expect(day).toContain("a reply, edited");
+    expect(day).not.toContain("earlier version");
   });
 
-  it("marks deleted messages and links threads", () => {
-    const day = files.get("general/2026/09/30.md")!;
-    expect(day).toMatch(/🗑 deleted 2026-09-29 \d\d:\d\d UTC/);
-    expect(day).toContain("🧵 [a thread](29/a-thread.md) · 1 message");
+  it("leaves out deleted messages, including from replies to them (raw/ keeps them)", () => {
+    const day = files.get("general/2026/09/29.md")!;
+    expect(day).not.toContain("regret this");
+    expect(day).not.toContain(`m${DELETED}`);
+    expect(day).toContain("> ↪ replying to a deleted message");
+  });
+
+  it("links threads from the message that started them", () => {
+    expect(files.get("general/2026/09/30.md")).toContain("🧵 [a thread](29/a-thread.md) · 1 message");
   });
 });
 
