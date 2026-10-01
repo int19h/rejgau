@@ -11,9 +11,12 @@ Status: the bot (phase 1) and the static reader with search (phase 2) are both i
 On the archive branch (default `archive`), under the configured folder:
 
 ```
-archive.json            format marker: {"format": 1, "guild_id": …}
-raw/YYYY/MM/DD.jsonl    one JSON object per line, UTC days
+archive.json                   format marker: {"format": 1, "guild_id": …}
+raw/YYYY/MM/DD/<channel>.jsonl one JSON object per line: a UTC day of one channel or thread (by ID)
+raw/YYYY/MM/DD/guild.jsonl     the same day's server-wide records: snapshots, roles, emoji, members, media, sessions, config
 ```
+
+Lines about a channel or thread (messages, edits, deletions, reactions, pins, polls, channel and thread events, and the bot's selection and backfill records for it) go into that channel's file, so one channel's history can be read or removed on its own. To read a day in order, merge its files by `at`.
 
 Each line is `{"at", "src", ["sid", "s"], "t", "d"}`:
 
@@ -147,7 +150,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://rejgau.<your-subdomai
 }
 ```
 
-- **`channels`**: `"all"` (every channel the bot can see), or a list of channel and/or category IDs. A category covers its current and future channels. Threads and forum posts follow their parent.
+- **`channels`**: `"all"` (every channel the bot can see), or a list of channel and/or category IDs. A category covers its current and future channels. Threads and forum posts follow their parent. Either way, a channel the bot can't view is never selected or named in the archive: the bot works out its View Channel permission from its roles and the channel's permission overwrites, and re-checks when roles or channels change (and its own roles hourly). Denying the bot's role View Channel on a channel is therefore enough to keep it out.
 - **`exclude`**: IDs to skip. These take precedence, and apply to descendants too.
 - **`backfill`**: when a channel becomes selected, fetch its whole history. Active threads are included; archived threads aren't yet.
 - **`pages`**: after commits, send a `repository_dispatch` (`archive-updated`) to the archive repo, at most once per 10 minutes, so the Pages workflow republishes the reader.
@@ -176,7 +179,7 @@ Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized reques
 
 Deletion is manual, by the archive admin:
 1. `POST /pause`, then `POST /flush`, in that order, so nothing is in flight and nothing new gets committed.
-2. Rewrite the `archive` branch however you like (e.g. `git filter-repo`), and force-push.
+2. Rewrite the `archive` branch however you like (e.g. `git filter-repo`), and force-push. To drop a whole channel: `git filter-repo --path-glob 'raw/*/*/*/<channel id>.jsonl' --invert-paths` (its threads have their own IDs).
 3. Delete the matching release assets.
 4. `POST /resume`.
 

@@ -5,7 +5,7 @@ import { defineConfig } from "vitest/config";
 // A throwaway GitHub App key in the PKCS#1 form GitHub issues, for the fake GitHub in worker tests.
 const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 
-export const TEST_GUILDS = ["101", "102", "103", "104", "105", "106", "107", "108", "109"];
+export const TEST_GUILDS = ["101", "102", "103", "104", "105", "106", "107", "108", "109", "110"];
 
 // Guild 108 selects everything except category 30; the rest select category 10 minus channel 13.
 const guildConfig = (g: string) =>

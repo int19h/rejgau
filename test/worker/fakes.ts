@@ -186,6 +186,12 @@ export class FakeDiscord {
   guilds = new Map<string, Record<string, any>>();
   /** user ID → guild member object, served by GET /guilds/{id}/members/{user}. */
   members = new Map<string, Record<string, any>>();
+  /** The bot's user ID (GET /users/@me). */
+  botId = "900";
+  /** guild ID → roles (GET /guilds/{id}/roles); by default @everyone can view channels. */
+  roles = new Map<string, { id: string; permissions: string }[]>();
+  /** guild ID → the bot's roles in it; by default none beyond @everyone. */
+  botRoles = new Map<string, string[]>();
   requests: string[] = [];
   /** Request paths (without query) that answer with this status instead. */
   failures = new Map<string, number>();
@@ -214,6 +220,13 @@ export class FakeDiscord {
       const newer = (this.messages.get(m[1]) ?? []).filter((msg) => BigInt(msg.id) > after).sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
       // Discord returns the `limit` messages right after `after`, newest first.
       return json(newer.slice(0, limit).reverse());
+    }
+    if (url.pathname === "/api/v10/users/@me") return json({ id: this.botId, username: "rejgau", bot: true });
+    if ((m = /^\/api\/v10\/guilds\/(\d+)\/roles$/.exec(url.pathname))) {
+      return json(this.roles.get(m[1]) ?? [{ id: m[1], permissions: String(1 << 10) }]);
+    }
+    if ((m = /^\/api\/v10\/guilds\/(\d+)\/members\/(\d+)$/.exec(url.pathname)) && m[2] === this.botId) {
+      return json({ user: { id: this.botId }, roles: this.botRoles.get(m[1]) ?? [] });
     }
     if ((m = /^\/api\/v10\/guilds\/(\d+)\/members\/(\d+)$/.exec(url.pathname))) {
       const member = this.members.get(m[2]);
