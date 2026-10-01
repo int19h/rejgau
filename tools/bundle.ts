@@ -1,6 +1,8 @@
-// Bundles the reader (reader/src/main.tsx) into <out>/reader.js + reader.css, and copies index.html.
+// Bundles the reader (reader/src/main.tsx) into <out>/reader.js + reader.css, and writes index.html
+// referring to them by content hash (?v=…), so browsers never pair a cached old bundle with new data.
 
-import { copyFileSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { build } from "esbuild";
 
@@ -27,5 +29,10 @@ export async function bundleReader(out: string): Promise<void> {
     outfile: join(out, "reader.css"),
     logLevel: "warning",
   });
-  copyFileSync(join(root, "reader/index.html"), join(out, "index.html"));
+  const hash = (file: string) => createHash("sha256").update(readFileSync(join(out, file))).digest("hex").slice(0, 12);
+  const html = readFileSync(join(root, "reader/index.html"), "utf8")
+    .replace('href="reader.css"', `href="reader.css?v=${hash("reader.css")}"`)
+    .replace('src="reader.js"', `src="reader.js?v=${hash("reader.js")}"`);
+  if (!html.includes("reader.js?v=") || !html.includes("reader.css?v=")) throw new Error("index.html: reader.js/reader.css references not found");
+  writeFileSync(join(out, "index.html"), html);
 }

@@ -61,10 +61,10 @@ export interface UsersFile {
 const BASE = "data/";
 const cache = new Map<string, Promise<any>>();
 
-export function load<T>(path: string): Promise<T> {
+function load<T>(path: string, init?: RequestInit): Promise<T> {
   let p = cache.get(path);
   if (!p) {
-    p = fetch(BASE + path).then((r) => {
+    p = fetch(BASE + path, init).then((r) => {
       if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
       return r.json();
     });
@@ -74,10 +74,14 @@ export function load<T>(path: string): Promise<T> {
   return p;
 }
 
-export const loadArchive = () => load<Archive>("archive.json");
-export const loadUsers = () => load<UsersFile>("users.json");
-export const loadMonth = (channel: string, month: string) => load<MonthFile>(`c/${channel}/${month}.json`);
-export const loadSearchMonth = (month: string) => load<any[]>(`search/${month}.json`);
+// Hosts like GitHub Pages let browsers cache files for a while (10 minutes there). archive.json is
+// always revalidated, and every other file is requested for that build (?v=<built_at>), so a new
+// deploy is seen at once and never mixed with cached files from an older one.
+export const loadArchive = () => load<Archive>("archive.json", { cache: "no-cache" });
+const loadBuild = async <T>(path: string) => load<T>(`${path}?v=${encodeURIComponent((await loadArchive()).built_at)}`);
+export const loadUsers = () => loadBuild<UsersFile>("users.json");
+export const loadMonth = (channel: string, month: string) => loadBuild<MonthFile>(`c/${channel}/${month}.json`);
+export const loadSearchMonth = (month: string) => loadBuild<any[]>(`search/${month}.json`);
 
 const DISCORD_EPOCH = 1420070400000n;
 export const snowflakeTime = (id: string) => Number((BigInt(id) >> 22n) + DISCORD_EPOCH);
