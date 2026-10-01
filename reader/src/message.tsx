@@ -355,7 +355,13 @@ export function Message({ msg, env, grouped, highlighted }: { msg: any; env: Msg
 
   return (
     <div id={`m${msg.id}`} class={cls}>
-      {referenced && (
+      {referenced?.deleted && (
+        <div class="reply">
+          <span class="reply-spine" />
+          <span class="reply-text muted">Original message was deleted</span>
+        </div>
+      )}
+      {referenced && !referenced.deleted && (
         <a class="reply" href={referenced.channel_id ? `#/c/${referenced.channel_id}/${monthOfId(referenced.id)}/${referenced.id}` : undefined}>
           <span class="reply-spine" />
           <Avatar user={refUser} env={env} guildId={guildId} small />

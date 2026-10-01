@@ -1,6 +1,6 @@
 // Builds the reader site for an archive:
 //   npx tsx tools/build.ts --archive <archive folder> --out <dir>
-// Reads <archive>/raw/**/*.jsonl, folds it, writes <out>/data/…, and bundles the reader into <out>.
+// Reads <archive>/raw/**/*.jsonl (raw/YYYY/MM/DD/<channel id or guild>.jsonl), folds it, writes <out>/data/…, and bundles the reader into <out>.
 
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -15,8 +15,11 @@ function arg(name: string, dflt?: string): string {
   return v;
 }
 
+/** A day's guild.jsonl (snapshots, roles, …) sorts before its channel files, for lines with equal times. */
+const fileOrder = (a: string, b: string) => Number(b === "guild.jsonl") - Number(a === "guild.jsonl") || (a < b ? -1 : a > b ? 1 : 0);
+
 function* jsonlFiles(dir: string): Generator<string> {
-  for (const name of readdirSync(dir).sort()) {
+  for (const name of readdirSync(dir).sort(fileOrder)) {
     const p = join(dir, name);
     if (statSync(p).isDirectory()) yield* jsonlFiles(p);
     else if (name.endsWith(".jsonl")) yield p;

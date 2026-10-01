@@ -12,6 +12,7 @@ const EXCLUDED = { id: "13", type: 0, name: "excluded-secret", parent_id: "10" }
 const OTHER = { id: "20", type: 0, name: "other-secret" };
 
 const T0 = Date.UTC(2026, 8, 29, 12, 0);
+const VIEW_CHANNEL = 1 << 10;
 // A snowflake created at 2026-09-29T17:13Z, and one from 2026-09-01.
 const MSG_ID = "1554541602075316245";
 const OLD_MSG_ID = String(((BigInt(Date.UTC(2026, 8, 1, 8)) - 1420070400000n) << 22n) + 1n);
@@ -40,7 +41,7 @@ function guildCreate(guildId: string, extra: Record<string, unknown> = {}) {
     id: guildId,
     name: "Test server",
     icon: null,
-    roles: [],
+    roles: [{ id: guildId, name: "@everyone", permissions: String(VIEW_CHANNEL) }],
     emojis: [],
     stickers: [],
     channels: [CATEGORY, GENERAL, EXCLUDED, OTHER],
@@ -75,11 +76,16 @@ function useGuild(g: string): void {
   discord.requests.length = 0;
 }
 
+/** All raw lines in time order (a day's guild.jsonl first on ties, as the reader build does). */
 function rawLines(files: Record<string, string>): any[] {
+  const key = (p: string) => p.replace(/\/guild\.jsonl$/, "/!guild.jsonl");
   return Object.keys(files)
     .filter((p) => p.startsWith("raw/"))
-    .sort()
-    .flatMap((p) => files[p].trimEnd().split("\n").map((l) => JSON.parse(l)));
+    .sort((a, b) => (key(a) < key(b) ? -1 : 1))
+    .flatMap((p) => files[p].trimEnd().split("\n").map((l) => JSON.parse(l)))
+    .map((l, i) => ({ l, i }))
+    .sort((a, b) => Date.parse(a.l.at) - Date.parse(b.l.at) || a.i - b.i)
+    .map((x) => x.l);
 }
 
 describe("GuildArchive", () => {
@@ -102,7 +108,7 @@ describe("GuildArchive", () => {
     // The empty repo got seeded, the archive branch created, and nothing leaked.
     expect(github.files("main")["README.md"]).toContain("rejgau");
     const files = github.files("archive");
-    expect(JSON.parse(files["archive.json"])).toMatchObject({ format: 1, guild_id: "101" });
+    expect(JSON.parse(files["archive.json"])).toMatchObject({ format: 2, guild_id: "101" });
     const all = Object.values(files).join("\n");
     for (const secret of ["secret stuff", "excluded stuff", "other-secret", "excluded-secret", "leaky", '"members"']) expect(all).not.toContain(secret);
 
@@ -159,7 +165,7 @@ describe("GuildArchive", () => {
     await stub.ingest("103", events("s1", [["GUILD_CREATE", guildCreate("103")]]));
     await settle("103");
     const files = github.files("archive");
-    expect(files["raw/2026/09/01.jsonl"]).toContain("old news");
+    expect(files["raw/2026/09/01/11.jsonl"]).toContain("old news");
     const lines = rawLines(files);
     expect(lines.find((l) => l.src === "rest")).toMatchObject({ t: "MESSAGE_CREATE", d: { id: OLD_MSG_ID } });
     expect(lines.some((l) => l.t === "BACKFILL_END" && l.d.channel_id === "11")).toBe(true);
@@ -193,7 +199,7 @@ describe("GuildArchive", () => {
     const s = env.GUILD.get(env.GUILD.idFromName(g));
     await s.ingest(g, events("s1", [["GUILD_CREATE", guildCreate(g)], ["MESSAGE_CREATE", message(MSG_ID, "11", "to be redacted", { guild_id: g })]]));
     await settle(g);
-    const day = "raw/2026/09/29.jsonl";
+    const day = "raw/2026/09/29/11.jsonl";
     expect(github.files("archive")[day]).toContain("to be redacted");
 
     // The admin force-pushes a rewritten history without that message.
@@ -236,5 +242,55 @@ describe("GuildArchive", () => {
     const all = JSON.stringify(lines);
     expect(all).toContain("now archived");
     expect(all).not.toContain("not anymore");
+  });
+});
+
+describe("channels the bot can't view", () => {
+  it("are never selected or named, and become archived when the bot gains access", async () => {
+    const g = "110";
+    useGuild(g);
+    const SECRET = {
+      id: "12", type: 0, name: "mods-only", topic: "secret topic", parent_id: "10",
+      permission_overwrites: [
+        { id: g, type: 0, allow: "0", deny: String(VIEW_CHANNEL) },
+        { id: "77", type: 0, allow: String(VIEW_CHANNEL), deny: "0" },
+      ],
+    };
+    const roles = [{ id: g, name: "@everyone", permissions: String(VIEW_CHANNEL) }, { id: "77", name: "mods", permissions: "0" }];
+    const s = env.GUILD.get(env.GUILD.idFromName(g));
+    await s.ingest(g, events("s1", [["GUILD_CREATE", guildCreate(g, { channels: [CATEGORY, GENERAL, SECRET], roles })]]));
+    await settle(g);
+    let all = Object.values(github.files("archive")).join("\n");
+    expect(all).toContain('"name":"general"');
+    expect(all).not.toContain("mods-only");
+    expect(all).not.toContain("secret topic");
+    expect(await s.status()).toMatchObject({ permissionsKnown: true, hiddenChannels: 1 });
+
+    // The bot is given the mods role: the channel becomes visible and is selected from then on.
+    await s.ingest(g, events("s1", [["GUILD_MEMBER_UPDATE", { guild_id: g, user: { id: discord.botId }, roles: ["77"] }]], 10));
+    await settle(g);
+    all = Object.values(github.files("archive")).join("\n");
+    expect(rawLines(github.files("archive")).filter((l) => l.t === "CHANNEL_SELECTED").map((l) => l.d.channel.id)).toEqual(["11", "12"]);
+    expect(await s.status()).toMatchObject({ hiddenChannels: 0 });
+
+    // A role change that removes access unselects it again.
+    await s.ingest(g, events("s1", [["GUILD_ROLE_UPDATE", { guild_id: g, role: { id: g, name: "@everyone", permissions: "0" } }]], 20));
+    await settle(g);
+    const unselected = rawLines(github.files("archive")).filter((l) => l.t === "CHANNEL_UNSELECTED").map((l) => l.d.id);
+    expect(unselected).toEqual(["11"]); // the mods role still grants #mods-only
+  });
+
+  it("files lines per channel per day, with server-wide records in guild.jsonl", () => {
+    const files = github.files("archive");
+    const raw = Object.keys(files).filter((p) => p.startsWith("raw/"));
+    expect(raw).toContain("raw/2026/09/29/guild.jsonl");
+    for (const path of raw) {
+      const scope = /^raw\/\d{4}\/\d{2}\/\d{2}\/(\d+|guild)\.jsonl$/.exec(path)?.[1];
+      expect(scope, path).toBeDefined();
+      for (const line of files[path].trimEnd().split("\n").map((l) => JSON.parse(l))) {
+        const concerns = line.t === "CHANNEL_SELECTED" ? line.d.channel.id : line.t === "CHANNEL_UNSELECTED" ? line.d.id : line.d.channel_id;
+        expect(`${line.t}:${concerns ?? "guild"}`).toBe(`${line.t}:${scope}`);
+      }
+    }
   });
 });

@@ -12,7 +12,7 @@
 import { posix } from "node:path";
 import { refForUrl, stickerRef } from "../src/media";
 import { MESSAGE_CHANNEL_TYPES, NORMAL_TYPES, SYSTEM_TEXT, THREAD_TYPES } from "../reader/src/data";
-import { tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, previewText, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { customEmoji, escapeHtml, escapeLine, escapeText, inlineCode, link, linkUrl, paragraphs, quote, renderMarkdown, type GfmContext } from "./gfm";
 
 const DISCORD_EPOCH = 1420070400000n;
@@ -29,7 +29,11 @@ const dayPath = (day: string) => `${day.slice(0, 4)}/${day.slice(5, 7)}/${day.sl
 
 function relLink(from: string, to: string): string {
   const rel = posix.relative(posix.dirname(from), to) || posix.basename(to);
-  return rel.split("/").map(encodeURIComponent).join("/");
+  // Also encode what encodeURIComponent leaves: an unbalanced ")" would end a Markdown link early.
+  return rel
+    .split("/")
+    .map((seg) => encodeURIComponent(seg).replace(/[()'!*~]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`))
+    .join("/");
 }
 
 /** A folder name for a channel: its name with path-unsafe characters replaced. */
@@ -84,7 +88,8 @@ interface Layout {
 function layout(state: ArchiveState): Layout {
   const messages = new Map<string, MessageState[]>();
   for (const ms of state.messages.values()) {
-    if (!state.channels.get(ms.channelId)?.selected) continue;
+    // Deleted messages (and earlier versions of edited ones) stay in raw/ but aren't published.
+    if (!isPublished(state, ms.channelId) || ms.deletedAt) continue;
     if (!messages.has(ms.channelId)) messages.set(ms.channelId, []);
     messages.get(ms.channelId)!.push(ms);
   }
@@ -103,7 +108,8 @@ function layout(state: ArchiveState): Layout {
   // Top-level channels get folders; threads get one file each in their parent's folder.
   const dir = new Map<string, string>();
   const page = new Map<string, string>();
-  const taken = new Set<string>();
+  // The root index is README.md, so no channel may take that name.
+  const taken = new Set<string>(["readme.md"]);
   /** A unique path (compared case-insensitively, for case-insensitive file systems). */
   const claim = (path: string, id: string) => {
     const name = taken.has(path.toLowerCase()) ? `${path}-${id}` : path;
@@ -112,7 +118,7 @@ function layout(state: ArchiveState): Layout {
   };
   // Channels with nothing archived (e.g. selected but unreadable) are left out.
   const hasThreads = (id: string) => [...messages.keys()].some((t) => state.channels.get(t)?.c.parent_id === id);
-  const selected = [...state.channels].filter(([id, ch]) => ch.selected && MESSAGE_CHANNEL_TYPES.has(ch.c.type) && (messages.has(id) || hasThreads(id)));
+  const selected = [...state.channels].filter(([id, ch]) => isPublished(state, id) && MESSAGE_CHANNEL_TYPES.has(ch.c.type) && (messages.has(id) || hasThreads(id)));
   const sortKey = ([id, ch]: [string, { c: any }]) => [ch.c.position ?? 0, id] as const;
   const ordered = (list: typeof selected) => list.sort((a, b) => sortKey(a)[0] - sortKey(b)[0] || (BigInt(a[0]) < BigInt(b[0]) ? -1 : 1));
   for (const [id, ch] of ordered(selected.filter(([, ch]) => !THREAD_TYPES.has(ch.c.type)))) {
@@ -157,7 +163,7 @@ function messageFile(l: Layout, channelId: string, messageId: string): string | 
 
 /** Where a message is rendered: file path plus anchor, if it's in the logs. */
 function messageHref(env: Env, channelId: string | undefined, messageId: string | undefined): string | null {
-  if (!channelId || !messageId || !env.state.messages.has(messageId)) return null;
+  if (!channelId || !messageId || !env.state.messages.has(messageId) || env.state.messages.get(messageId)!.deletedAt) return null;
   const file = messageFile(env.layout, channelId, messageId);
   return file ? `${relLink(env.file, file)}#m${messageId}` : null;
 }
@@ -205,7 +211,7 @@ const isSpoilerAttachment = (a: any) => !!(a.flags & 8) || !!a.is_spoiler || Str
 
 function emojiText(e: any): string {
   if (!e) return "";
-  return e.id ? customEmoji(e.name) : String(e.name ?? "");
+  return e.id ? customEmoji(e.name) : escapeText(String(e.name ?? ""));
 }
 
 interface Body {
@@ -389,7 +395,6 @@ function renderMessage(env: Env, ms: MessageState): string {
       if (href) text = `pinned <a href="${escapeHtml(href)}">a message</a> to this channel.`;
     }
     out.push(`<p align="center"><tt>→ ${name} ${text} · <a id="m${m.id}" href="#m${m.id}">${hhmm(ts)}</a></tt></p>`);
-    if (ms.deletedAt) out.push(`<sub>🗑 deleted ${dateTime(ms.deletedAt)} UTC</sub>`);
     return out.join("\n\n");
   }
 
@@ -398,9 +403,11 @@ function renderMessage(env: Env, ms: MessageState): string {
 
   // Context under the header: what this replies to, which app command produced it.
   const context: string[] = [];
-  const ref = m.referenced_message ?? (m.type === 21 && m.message_reference?.message_id ? env.state.messages.get(m.message_reference.message_id)?.m : undefined);
-  if (ref?.id) {
-    const snippet = String(ref.content ?? "").replace(/\s+/g, " ").slice(0, 100) || (ref.attachments?.length ? "attachment" : ref.embeds?.length ? "embed" : "message");
+  const ref = referencedMessage(env.state, m);
+  if (ref === "deleted") {
+    context.push("> ↪ replying to a deleted message");
+  } else if (ref?.id) {
+    const snippet = previewText(ref.content, 100) || (ref.attachments?.length ? "attachment" : ref.embeds?.length ? "embed" : "message");
     const href = messageHref(env, ref.channel_id ?? m.channel_id, ref.id);
     context.push(`> ↪ replying to **${escapeLine(displayName(ref.author))}**: ${href ? `[${escapeLine(snippet)}](${href})` : escapeLine(snippet)}`);
   } else if (m.message_reference?.message_id && m.type === 19) {
@@ -427,17 +434,8 @@ function renderMessage(env: Env, ms: MessageState): string {
     out.push(quote(inner));
   }
 
-  const meta: string[] = [];
-  if (m.edited_timestamp) meta.push(`edited ${dateTime(m.edited_timestamp)} UTC`);
-  if (ms.deletedAt) meta.push(`🗑 deleted ${dateTime(ms.deletedAt)} UTC`);
-  if (meta.length) out.push(`<sub>${meta.join(" · ")}</sub>`);
-  if (ms.edits.length) {
-    const versions = ms.edits.map((e) => {
-      const eb = body(env, { ...e, flags: m.flags }, ctx);
-      return [`*Version from ${dateTime(e.ts ?? ts)} UTC:*`, wrapSpoiler(eb) || "*(empty)*"].join("\n\n");
-    });
-    out.push(`<details><summary>${plural(ms.edits.length, "earlier version")}</summary>\n\n${versions.join("\n\n---\n\n")}\n\n</details>`);
-  }
+  // Only the current version is shown; earlier ones stay in raw/.
+  if (m.edited_timestamp) out.push(`<sub>edited ${dateTime(m.edited_timestamp)} UTC</sub>`);
 
   if (ms.reactions.size) {
     out.push(

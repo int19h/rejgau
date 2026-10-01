@@ -86,8 +86,9 @@ Everything below lives under a configurable folder on the `archive` branch. All 
 
 ```
 <folder>/
-  archive.json                  { format: 1, guild_id, generator }
-  raw/YYYY/MM/DD.jsonl          RAW: every archived event, verbatim, plus rejgau records (the bot only appends here)
+  archive.json                  { format: 2, guild_id, generator }   (format 1 had one raw/YYYY/MM/DD.jsonl per day)
+  raw/YYYY/MM/DD/<channel>.jsonl RAW: every archived event, verbatim, plus rejgau records (the bot only appends here);
+                                one file per channel or thread and day, guild.jsonl for server-wide records
   -- phase 2 (reader), generated from raw/ by a GitHub Action:
   guild.json                    latest guild snapshot (from GUILD_SNAPSHOT / GUILD_UPDATE / role & emoji events)
   channels.json                 id → latest object of every archived channel & thread and their ancestors

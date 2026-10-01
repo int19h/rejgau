@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       source: ${{ steps.source.outputs.source }}
+      logs: ${{ steps.logs.outcome }}
     # Coalesce bursts of updates; the deploy job below is never cancelled mid-way.
     concurrency:
       group: pages-build
@@ -55,8 +56,10 @@ jobs:
           cache-dependency-path: rejgau/package-lock.json
       - run: npm ci --ignore-scripts
         working-directory: rejgau
-      - run: npm run build:site -- --archive "../archive/${{ vars.ARCHIVE_PATH }}" --out ../site
+      - run: npm run build:site -- --archive "../archive/$ARCHIVE_PATH" --out ../site
         working-directory: rejgau
+        env:
+          ARCHIVE_PATH: ${{ vars.ARCHIVE_PATH }}
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: site
@@ -65,12 +68,18 @@ jobs:
         env:
           ARCHIVE_BRANCH: ${{ vars.ARCHIVE_BRANCH || 'archive' }}
         run: echo "source=$ARCHIVE_BRANCH@$(git -C archive rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-      - if: vars.LOGS_BRANCH != 'none'
-        run: npm run build:logs -- --archive "../archive/${{ vars.ARCHIVE_PATH }}" --out ../logs --source "$SOURCE"
+      # A failure here shouldn't stop the site from deploying: it's reported, and the logs job skipped.
+      - id: logs
+        if: vars.LOGS_BRANCH != 'none'
+        continue-on-error: true
+        run: npm run build:logs -- --archive "../archive/$ARCHIVE_PATH" --out ../logs --source "$SOURCE"
         working-directory: rejgau
         env:
+          ARCHIVE_PATH: ${{ vars.ARCHIVE_PATH }}
           SOURCE: ${{ steps.source.outputs.source }}
-      - if: vars.LOGS_BRANCH != 'none'
+      - if: steps.logs.outcome == 'failure'
+        run: echo "::warning::Rendering the logs failed, so the logs branch wasn't updated (the site still deploys)."
+      - if: steps.logs.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: logs
@@ -96,7 +105,7 @@ jobs:
 
   logs:
     needs: build
-    if: vars.LOGS_BRANCH != 'none'
+    if: vars.LOGS_BRANCH != 'none' && needs.build.outputs.logs == 'success'
     runs-on: ubuntu-latest
     # Only this job can push, and it runs no third-party packages: just git on the build's output.
     permissions:
@@ -106,6 +115,7 @@ jobs:
       cancel-in-progress: false
     env:
       LOGS_BRANCH: ${{ vars.LOGS_BRANCH || 'logs' }}
+      ARCHIVE_BRANCH: ${{ vars.ARCHIVE_BRANCH || 'archive' }}
       SOURCE: ${{ needs.build.outputs.source }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -117,6 +127,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # This force-pushes: never over the bot's branch or the default branch.
+          default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          if [ -z "$LOGS_BRANCH" ] || [ "$LOGS_BRANCH" = "$ARCHIVE_BRANCH" ] || [ "$LOGS_BRANCH" = "$default_branch" ]; then
+            echo "::error::LOGS_BRANCH ($LOGS_BRANCH) must not be the archive branch ($ARCHIVE_BRANCH) or the default branch ($default_branch)"
+            exit 1
+          fi
           git init -q -b "$LOGS_BRANCH"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

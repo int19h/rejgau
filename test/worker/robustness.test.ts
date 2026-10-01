@@ -178,3 +178,56 @@ describe("reset", () => {
     expect(snapshots()).toBe(before + 1);
   });
 });
+
+describe("permission refresh failures", () => {
+  const VIEW = String(1 << 10);
+  const tree = [
+    { id: "10", type: 4, name: "cat-a" },
+    { id: "11", type: 0, name: "open", parent_id: "10" },
+    { id: "12", type: 0, name: "closed", parent_id: "10", permission_overwrites: [{ id: "111", type: 0, allow: "0", deny: VIEW }] },
+  ];
+
+  it("retry the whole batch while permissions are unknown (and Discord is failing), instead of failing an event", async () => {
+    discord.guilds.set("111", { id: "111", name: "g", roles: [{ id: "111", permissions: VIEW }], channels: tree, threads: [] });
+    discord.failures.set("/api/v10/guilds/111/roles", 503);
+    const batch = events("s9", [["MESSAGE_CREATE", message("1554541602075316800", "11", "kept", { guild_id: "111" })]], 200);
+    expect(await stub("111").ingest("111", batch)).toMatchObject({ handled: 0, failed: { retryable: true } });
+    discord.failures.delete("/api/v10/guilds/111/roles");
+    expect(await stub("111").ingest("111", batch)).toEqual({ handled: 1 });
+    await settle("111");
+    expect(committed("111")).toContain("kept");
+    expect(committed("111")).not.toContain('"closed"');
+  });
+
+  it("keep the known permissions when a refresh fails, without holding up events", async () => {
+    discord.failures.set("/api/v10/guilds/111/roles", 403);
+    const before = discord.requests.filter((r) => r.endsWith("/guilds/111/roles")).length;
+    // An event from a channel believed hidden forces a refresh, which fails: it's logged, not fatal.
+    const result = await stub("111").ingest("111", events("s9", [
+      ["MESSAGE_CREATE", message("1554541602075316801", "12", "from closed", { guild_id: "111" })],
+      ["MESSAGE_CREATE", message("1554541602075316802", "11", "still archived", { guild_id: "111" })],
+      ["MESSAGE_CREATE", message("1554541602075316803", "12", "again", { guild_id: "111" })],
+    ], 201));
+    expect(result).toEqual({ handled: 3 });
+    expect(discord.requests.filter((r) => r.endsWith("/guilds/111/roles")).length - before).toBe(1);
+    discord.failures.delete("/api/v10/guilds/111/roles");
+    await settle("111");
+    expect(committed("111")).toContain("still archived");
+    expect(committed("111")).not.toContain("from closed");
+  });
+});
+
+describe("a guild whose permissions are refused for good", () => {
+  it("doesn't hold up the pump: its batches are dropped and the error reported, then retried later", async () => {
+    // E.g. a configured guild the bot isn't in: every batch is just session markers.
+    discord.failures.set("/api/v10/guilds/112/roles", 404);
+    const marker = events("s9", [["SESSION_RESUMED", {}]], 300);
+    expect(await stub("112").ingest("112", marker)).toEqual({ handled: 1 });
+    expect((await stub("112").status()).permissionsError).toMatch(/404/);
+    const calls = discord.requests.filter((r) => r.endsWith("/guilds/112/roles")).length;
+    // Within the wait, no new attempts (and still no failure reported to the pump).
+    expect(await stub("112").ingest("112", events("s9", [["SESSION_RESUMED", {}]], 301))).toEqual({ handled: 1 });
+    expect(discord.requests.filter((r) => r.endsWith("/guilds/112/roles")).length).toBe(calls);
+    discord.failures.delete("/api/v10/guilds/112/roles");
+  });
+});

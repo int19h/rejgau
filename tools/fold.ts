@@ -96,6 +96,36 @@ export function orderLines(lines: RawLine[]): RawLine[] {
     .map((x) => x.l);
 }
 
+const THREAD_TYPES = new Set([10, 11, 12]);
+
+/**
+ * Whether a channel's messages are published: it's selected and, for a thread, so is its parent. (A
+ * deleted thread is never unselected, so it could outlive its parent's selection otherwise.)
+ */
+export function isPublished(state: ArchiveState, id: string): boolean {
+  const ch = state.channels.get(id);
+  if (!ch?.selected) return false;
+  return !THREAD_TYPES.has(ch.c.type) || !!state.channels.get(ch.c.parent_id)?.selected;
+}
+
+/**
+ * The message a reply (or a thread's first message) refers to, as the public outputs show it: the
+ * current version when it's archived, "deleted" when it was deleted (deleted messages and earlier
+ * versions are only kept in raw/), otherwise the copy Discord embedded, or null.
+ */
+export function referencedMessage(state: ArchiveState, m: any): any | "deleted" | null {
+  const id = m.referenced_message?.id ?? (m.type === 19 || m.type === 21 ? m.message_reference?.message_id : undefined);
+  if (!id) return null;
+  const known = state.messages.get(id);
+  if (known) return known.deletedAt ? "deleted" : known.m;
+  return m.type === 21 ? null : (m.referenced_message ?? null);
+}
+
+/** A one-line preview of message text (for replies), with spoilers masked as Discord does. */
+export function previewText(content: unknown, max: number): string {
+  return String(content ?? "").replace(/\|\|[\s\S]*?\|\|/g, "[spoiler]").replace(/\s+/g, " ").slice(0, max);
+}
+
 export function emptyState(): ArchiveState {
   return { guild: {}, channels: new Map(), messages: new Map(), memberSnapshots: new Map(), media: new Map(), reactors: new Map() };
 }
