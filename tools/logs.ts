@@ -513,9 +513,10 @@ function channelIndex(env: Env, channelId: string): string {
   return `${parts.join("\n\n")}\n`;
 }
 
-function rootIndex(env: Env, builtAt: string): string {
+function rootIndex(env: Env, source?: string): string {
   const g = env.state.guild;
-  const parts = [`# ${escapeLine(g.name ?? "Archive")}`, `<sub>Rendered from the rejgau archive on ${dateTime(builtAt)} UTC. Times are UTC. The raw logs are on the \`archive\` branch.</sub>`];
+  const from = source ? ` (${inlineCode(source)})` : "";
+  const parts = [`# ${escapeLine(g.name ?? "Archive")}`, `<sub>Rendered by rejgau from the raw logs${from}. Times are UTC.</sub>`];
   const top = [...env.layout.dir.keys()];
   const groups = new Map<string, string[]>();
   for (const id of top) {
@@ -559,12 +560,15 @@ function threadDayFile(env: Env, threadId: string, day: string, list: MessageSta
   return `${parts.join("\n\n")}\n`;
 }
 
-/** Builds every log file: path → GFM text. */
-export function buildLogs(state: ArchiveState, builtAt = new Date().toISOString()): Map<string, string> {
+/**
+ * Builds every log file: path → GFM text. The output depends only on the archive (no build time),
+ * so an unchanged archive renders identically. `source` names it in the index, e.g. a commit.
+ */
+export function buildLogs(state: ArchiveState, opts: { source?: string } = {}): Map<string, string> {
   const files = new Map<string, string>();
   const l = layout(state);
   const env = (file: string): Env => ({ state, layout: l, file, guildId: state.guild.id ?? "" });
-  files.set("README.md", rootIndex(env("README.md"), builtAt));
+  files.set("README.md", rootIndex(env("README.md"), opts.source));
   for (const [id, byDay] of l.threadDays) {
     const days = [...byDay.keys()];
     days.forEach((day, i) => files.set(byDay.get(day)!, threadDayFile(env(byDay.get(day)!), id, day, l.days.get(id)!.get(day)!, days[i - 1], days[i + 1])));

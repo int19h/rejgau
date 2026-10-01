@@ -26,7 +26,7 @@ const lines: RawLine[] = [
   line("MESSAGE_CREATE", M("1554541602075316500", "12", { content: "voice chat" }), 11),
   line("MEDIA_STORED", { key: "att-3-p.png", url: "https://github.com/o/r/releases/download/media-2026-09/att-3-p.png" }, 12, "rejgau"),
 ];
-const files = buildLogs(fold(lines), "2026-10-01T00:00:00Z");
+const files = buildLogs(fold(lines), { source: "archive@abc1234" });
 
 describe("buildLogs", () => {
   it("lays out channels, threads and days; skips channels with nothing archived; avoids folder clashes", () => {
@@ -41,6 +41,7 @@ describe("buildLogs", () => {
     ]);
     const root = files.get("README.md")!;
     expect(root).toContain("# Guild \\<b\\>");
+    expect(root).toContain("Rendered by rejgau from the raw logs (`archive@abc1234`).");
     expect(root).toContain("## Text\n\n- [#general](general/README.md) · 3 messages");
     expect(files.get("general/README.md")).toContain("- **a thread** · 1 message · [2026-09-29](2026/09/29/a-thread.md)");
     const thread = files.get("general/2026/09/29/a-thread.md")!;
