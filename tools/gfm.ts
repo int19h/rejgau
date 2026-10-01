@@ -38,6 +38,16 @@ export function escapeText(s: string, lineStart = false): string {
 /** Escapes text that is shown as one line (names, titles, snippets): newlines become spaces. */
 export const escapeLine = (s: string) => escapeText(String(s ?? "").replace(/\s*\n\s*/g, " "));
 
+/**
+ * A custom emoji as text. GitHub turns `:name:` into its own emoji whenever the name is one of its
+ * (case-sensitive, lowercase) shortcodes, even when escaped; an empty comment before the closing
+ * colon stops that and renders as nothing.
+ */
+export function customEmoji(name: unknown): string {
+  const text = escapeText(String(name ?? "emoji"));
+  return /^[a-z0-9_+-]+$/.test(String(name)) ? `:${text}<!-- -->:` : `:${text}:`;
+}
+
 /** A URL for a link or image destination: only http(s), in angle brackets so no escaping applies. */
 export function linkUrl(raw: unknown): string | null {
   const url = safeUrl(raw);
@@ -186,7 +196,7 @@ function inlineNode(n: MdNode, st: RenderState, lineStart: boolean): string {
     case "here":
       return "**@here**";
     case "emoji":
-      return escapeText(`:${n.name}:`);
+      return customEmoji(n.name);
     case "twemoji":
       return String(n.name ?? "");
     case "timestamp":

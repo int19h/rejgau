@@ -53,7 +53,8 @@ describe("Discord markdown", () => {
       "**@Alice\\_B** **@mods** [**#general**](general/README.md) **@unknown-user**",
     );
     expect(md("<t:1700000000:f> <t:1700000000:d>")).toBe("**2023-11-14 22:13 UTC** **2023-11-14**");
-    expect(md("<:smile:123456789012345678> 😀")).toBe(":smile: 😀");
+    // GitHub would turn a lowercase shortcode into its own emoji; mixed case is left alone.
+    expect(md("<:smile:123456789012345678> <:Yeet:123456789012345679> 😀")).toBe(":smile<!-- -->: :Yeet: 😀");
   });
 
   it("only links http(s) URLs", () => {

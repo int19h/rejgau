@@ -12,7 +12,7 @@ import { posix } from "node:path";
 import { refForUrl, stickerRef } from "../src/media";
 import { MESSAGE_CHANNEL_TYPES, NORMAL_TYPES, SYSTEM_TEXT, THREAD_TYPES } from "../reader/src/data";
 import { tallyCount, type ArchiveState, type MessageState } from "./fold";
-import { escapeLine, escapeText, inlineCode, link, linkUrl, paragraphs, quote, renderMarkdown, type GfmContext } from "./gfm";
+import { customEmoji, escapeLine, escapeText, inlineCode, link, linkUrl, paragraphs, quote, renderMarkdown, type GfmContext } from "./gfm";
 
 const DISCORD_EPOCH = 1420070400000n;
 const snowflakeTime = (id: string) => Number((BigInt(id) >> 22n) + DISCORD_EPOCH);
@@ -195,7 +195,7 @@ const isSpoilerAttachment = (a: any) => !!(a.flags & 8) || !!a.is_spoiler || Str
 
 function emojiText(e: any): string {
   if (!e) return "";
-  return e.id ? escapeText(`:${e.name ?? "emoji"}:`) : String(e.name ?? "");
+  return e.id ? customEmoji(e.name) : String(e.name ?? "");
 }
 
 interface Body {
