@@ -187,9 +187,9 @@ describe("permission refresh failures", () => {
     { id: "12", type: 0, name: "closed", parent_id: "10", permission_overwrites: [{ id: "111", type: 0, allow: "0", deny: VIEW }] },
   ];
 
-  it("retry the whole batch while permissions are unknown, instead of failing an event", async () => {
+  it("retry the whole batch while permissions are unknown (and Discord is failing), instead of failing an event", async () => {
     discord.guilds.set("111", { id: "111", name: "g", roles: [{ id: "111", permissions: VIEW }], channels: tree, threads: [] });
-    discord.failures.set("/api/v10/guilds/111/roles", 403);
+    discord.failures.set("/api/v10/guilds/111/roles", 503);
     const batch = events("s9", [["MESSAGE_CREATE", message("1554541602075316800", "11", "kept", { guild_id: "111" })]], 200);
     expect(await stub("111").ingest("111", batch)).toMatchObject({ handled: 0, failed: { retryable: true } });
     discord.failures.delete("/api/v10/guilds/111/roles");
@@ -214,5 +214,20 @@ describe("permission refresh failures", () => {
     await settle("111");
     expect(committed("111")).toContain("still archived");
     expect(committed("111")).not.toContain("from closed");
+  });
+});
+
+describe("a guild whose permissions are refused for good", () => {
+  it("doesn't hold up the pump: its batches are dropped and the error reported, then retried later", async () => {
+    // E.g. a configured guild the bot isn't in: every batch is just session markers.
+    discord.failures.set("/api/v10/guilds/112/roles", 404);
+    const marker = events("s9", [["SESSION_RESUMED", {}]], 300);
+    expect(await stub("112").ingest("112", marker)).toEqual({ handled: 1 });
+    expect((await stub("112").status()).permissionsError).toMatch(/404/);
+    const calls = discord.requests.filter((r) => r.endsWith("/guilds/112/roles")).length;
+    // Within the wait, no new attempts (and still no failure reported to the pump).
+    expect(await stub("112").ingest("112", events("s9", [["SESSION_RESUMED", {}]], 301))).toEqual({ handled: 1 });
+    expect(discord.requests.filter((r) => r.endsWith("/guilds/112/roles")).length).toBe(calls);
+    discord.failures.delete("/api/v10/guilds/112/roles");
   });
 });

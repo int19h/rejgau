@@ -181,7 +181,7 @@ Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized reques
 
 Deletion is manual, by the archive admin:
 1. `POST /pause`, then `POST /flush`, in that order, so nothing is in flight and nothing new gets committed.
-2. Rewrite the `archive` branch however you like (e.g. `git filter-repo`), and force-push. To drop a whole channel: `git filter-repo --path-glob 'raw/*/*/*/<channel id>.jsonl' --invert-paths`, and the same for each of its threads (they have their own IDs). Some traces stay in `guild.jsonl` and need editing by hand: `THREAD_LIST_SYNC` events (thread objects, including names), `CATCHUP_BEGIN` records (channel IDs), and media records for emoji and avatars seen there. Attachment media records are filed with their channel.
+2. Rewrite the `archive` branch however you like (e.g. `git filter-repo`), and force-push. To drop a whole channel: `git filter-repo --path-glob 'raw/*/*/*/<channel id>.jsonl' --invert-paths`, and the same for each of its threads (they have their own IDs). Some traces stay in `guild.jsonl` and need editing by hand: `THREAD_LIST_SYNC` events (thread objects, including names), `CATCHUP_BEGIN` records (channel IDs), and media records for anything without a channel of its own: emoji, stickers, avatars, embed images (`ext-…`) and attachments of forwarded messages. Attachment media records are filed with their channel.
 3. Delete the matching release assets.
 4. `POST /resume`.
 

@@ -40,6 +40,8 @@ const CHANNEL_EVENTS = new Set(["CHANNEL_CREATE", "CHANNEL_UPDATE", "CHANNEL_DEL
 const PERMISSION_REFRESH_MS = 60 * 60_000;
 /** After a failed refresh (with permissions already known), wait this long before trying again. */
 const PERMISSION_RETRY_MS = 5 * 60_000;
+/** After permissions were refused for good (and aren't known), drop batches this long before retrying. */
+const PERMISSION_FAILED_WAIT_MS = 10 * 60_000;
 
 const MAX_FLUSH_PATHS = 40;
 const MAX_FLUSH_BYTES = 8 * 1024 * 1024;
@@ -231,7 +233,11 @@ export class GuildArchive extends DurableObject<Env> {
       this.set("permRoles", JSON.stringify(map));
     }
     if (Array.isArray(memberRoles)) this.set("botRoles", JSON.stringify(memberRoles));
-    if (Array.isArray(roles) && Array.isArray(memberRoles)) this.set("permAt", String(Date.now()));
+    if (Array.isArray(roles) && Array.isArray(memberRoles)) {
+      this.set("permAt", String(Date.now()));
+      this.set("permissionsError", null);
+      this.set("permFailedAt", null);
+    }
     const changed = before !== `${this.get("permRoles")}|${this.get("botRoles")}`;
     if (changed) this.applyVisibility();
     return changed;
@@ -390,12 +396,22 @@ export class GuildArchive extends DurableObject<Env> {
     if (!conf) return { handled: events.length }; // guild removed from config: drop
     const { guild } = conf;
     // Permissions first, so a config change below is evaluated against them.
+    if (!this.permissions() && Date.now() - Number(this.get("permFailedAt") ?? "0") < PERMISSION_FAILED_WAIT_MS) {
+      return { handled: events.length }; // refused for good recently (see below): fail closed
+    }
     try {
       if ((await this.ensurePermissions(guildId)) && this.get("initialized")) this.reconcile(guild);
     } catch (e) {
-      // Not knowing them isn't any event's fault: have the whole batch retried.
       log("permissions_unknown", { error: errorMessage(e) });
-      return { handled: 0, failed: { retryable: true, error: `permissions unknown: ${errorMessage(e).slice(0, 400)}` } };
+      if (isTransient(e)) {
+        // Not any event's fault: have the whole batch retried.
+        return { handled: 0, failed: { retryable: true, error: `permissions unknown: ${errorMessage(e).slice(0, 400)}` } };
+      }
+      // Refused for good (e.g. the bot isn't in this guild): like a refused bootstrap, drop the batch
+      // rather than hold up the pump (and every other guild), report it, and try again later.
+      this.set("permissionsError", errorMessage(e).slice(0, 300));
+      this.set("permFailedAt", String(Date.now()));
+      return { handled: events.length };
     }
     this.checkConfigChange(guild);
     let handled = 0;
@@ -996,6 +1012,7 @@ export class GuildArchive extends DurableObject<Env> {
       bootstrapError: this.get("bootstrapError"),
       permissionsKnown: this.permissions() !== null,
       administrator: isAdministrator(this.permissions()),
+      permissionsError: this.get("permissionsError"),
       hiddenChannels: [...this.channels.values()].filter((c) => c.hidden && !c.deleted && c.type !== 4).length,
     };
   }
@@ -1028,14 +1045,17 @@ export class GuildArchive extends DurableObject<Env> {
    * Forgets everything about this guild (buffer, channel state, cursors, media queue), so the next
    * event bootstraps and backfills from scratch. For test setups; already-uploaded media is reused.
    */
-  async reset(): Promise<void> {
-    // Let an in-flight ingest finish first, so nothing it acknowledged is silently wiped mid-way.
-    await this.ingestChain.catch(() => {});
-    await this.ctx.storage.deleteAlarm();
-    await this.ctx.storage.deleteAll();
-    // abort() discards writes not yet confirmed on disk, so wait for the wipe before restarting.
-    await this.ctx.storage.sync();
-    this.ctx.abort("reset", { retryAlarm: false }); // restart with fresh tables
+  reset(): Promise<void> {
+    // On the ingest chain, so no ingest runs before or during the wipe.
+    const run = this.ingestChain.then(async () => {
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAll();
+      // abort() discards writes not yet confirmed on disk, so wait for the wipe before restarting.
+      await this.ctx.storage.sync();
+      this.ctx.abort("reset", { retryAlarm: false }); // restart with fresh tables
+    });
+    this.ingestChain = run.then(() => {}, () => {});
+    return run;
   }
 
   /**
@@ -1098,6 +1118,8 @@ export interface GuildStatus {
   permissionsKnown: boolean;
   /** The bot has Administrator, so it can view every channel and denies don't keep any out. */
   administrator: boolean;
+  /** Why the bot's permissions couldn't be read (e.g. it isn't in the guild); retried every 10 minutes. */
+  permissionsError: string | null;
   /** Channels (not threads) the bot can't view, which are never archived. */
   hiddenChannels: number;
 }

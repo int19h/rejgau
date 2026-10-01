@@ -77,6 +77,8 @@ jobs:
         env:
           ARCHIVE_PATH: ${{ vars.ARCHIVE_PATH }}
           SOURCE: ${{ steps.source.outputs.source }}
+      - if: steps.logs.outcome == 'failure'
+        run: echo "::warning::Rendering the logs failed, so the logs branch wasn't updated (the site still deploys)."
       - if: steps.logs.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
