@@ -7,7 +7,8 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit && tsc --noEmit -p test/unit && tsc --noEmit -p test/worker && tsc --noEmit -p reader && tsc --noEmit -p tools",
     "test": "vitest run",
-    "build:site": "tsx tools/build.ts"
+    "build:site": "tsx tools/build.ts",
+    "build:logs": "tsx tools/buildlogs.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.0.0",

@@ -1,8 +1,7 @@
-// Discord-flavoured markdown: parsing (discord-markdown-parser plus a list rule it lacks) and
-// rendering to Preact. Everything is rendered as escaped text or safe elements; the only raw HTML is
-// highlight.js output for code blocks, which escapes its input.
+// Discord-flavoured markdown rendering to Preact (parsing is in mdparse.ts). Everything is rendered
+// as escaped text or safe elements; the only raw HTML is highlight.js output for code blocks, which
+// escapes its input.
 
-import { rulesExtended, SimpleMarkdown } from "discord-markdown-parser";
 import hljs from "highlight.js/lib/core";
 import bash from "highlight.js/lib/languages/bash";
 import c from "highlight.js/lib/languages/c";
@@ -22,6 +21,7 @@ import yaml from "highlight.js/lib/languages/yaml";
 import type { ComponentChildren, JSX } from "preact";
 import { useState } from "preact/hooks";
 import { emojiRef } from "../../src/media";
+import { parseMarkdown, type MdNode } from "./mdparse";
 import { safeUrl } from "./url";
 
 for (const [name, lang] of Object.entries({ bash, c, cpp, css, diff, go, java, javascript, json, python, rust, sql, typescript, xml, yaml })) {
@@ -35,37 +35,7 @@ hljs.registerAliases(["rs"], { languageName: "rust" });
 hljs.registerAliases(["html", "svg"], { languageName: "xml" });
 hljs.registerAliases(["yml"], { languageName: "yaml" });
 
-// Discord supports "- item", "* item" and "1. item" lists at the start of a line (nesting by indent).
-const LIST_ITEM = /^( *)([-*]|\d{1,9}\.) +([^\n]*)(?:\n|$)/;
-const listItem = {
-  order: (SimpleMarkdown.defaultRules.heading as any).order - 0.4,
-  match(source: string, state: any) {
-    // Same line-start test the package uses for headings and subtext.
-    if (state.prevCapture == null || state.prevCapture.slice(-1)[0] === "\n" || String(state.prevCapture[0]).endsWith("\n")) {
-      return LIST_ITEM.exec(source);
-    }
-    return null;
-  },
-  parse(capture: string[], parse: any, state: any) {
-    return {
-      indent: Math.floor(capture[1].length / 2),
-      ordered: capture[2].endsWith("."),
-      start: capture[2].endsWith(".") ? Number(capture[2].slice(0, -1)) : undefined,
-      content: parse(capture[3], state),
-    };
-  },
-};
-
-const parser = SimpleMarkdown.parserFor({ ...rulesExtended, listItem } as any);
-
-export interface MdNode {
-  type: string;
-  [k: string]: any;
-}
-
-export function parseMarkdown(src: string): MdNode[] {
-  return parser(src, { inline: true }) as MdNode[];
-}
+export { parseMarkdown, type MdNode };
 
 export interface MdContext {
   /** Resolves a user mention to a display name (and optional role colour). */

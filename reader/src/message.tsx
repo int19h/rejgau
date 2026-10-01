@@ -4,7 +4,7 @@
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
 import { avatarRef, emojiRef, memberAvatarRef, refForUrl, stickerRef } from "../../src/media";
-import { displayName, hexColor, monthOfId, roleColor, type Archive, type MonthFile, type UserSnap, type UsersFile } from "./data";
+import { displayName, hexColor, monthOfId, NORMAL_TYPES, roleColor, SYSTEM_TEXT, type Archive, type MonthFile, type UserSnap, type UsersFile } from "./data";
 import { Markdown, type MdContext } from "./markdown";
 import { safeUrl } from "./url";
 
@@ -327,25 +327,6 @@ function Body({ m, msg, env, ctx }: { m: any; msg: any; env: MsgEnv; ctx: MdCont
     </>
   );
 }
-
-const SYSTEM_TEXT: Record<number, string> = {
-  1: "added someone to the thread.",
-  2: "removed someone from the thread.",
-  4: "changed the channel name.",
-  5: "changed the channel icon.",
-  6: "pinned a message to this channel.",
-  7: "joined the server.",
-  8: "boosted the server!",
-  9: "boosted the server! The server has reached Level 1!",
-  10: "boosted the server! The server has reached Level 2!",
-  11: "boosted the server! The server has reached Level 3!",
-  12: "added a channel follow.",
-  18: "started a thread",
-  46: "'s poll has closed.",
-};
-
-/** Message types rendered as regular messages; everything else is a compact system line. */
-const NORMAL_TYPES = new Set([0, 19, 20, 21, 23]);
 
 export function Message({ msg, env, grouped, highlighted }: { msg: any; env: MsgEnv; grouped: boolean; highlighted: boolean }) {
   const [showEdits, setShowEdits] = useState(false);
