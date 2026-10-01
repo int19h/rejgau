@@ -1,0 +1,110 @@
+import { describe, expect, it } from "vitest";
+import { fold, type RawLine } from "../../tools/fold";
+import { buildLogs } from "../../tools/logs";
+
+const line = (t: string, d: any, i: number, src: RawLine["src"] = "gw"): RawLine => ({ at: new Date(Date.UTC(2026, 8, 29) + i * 1000).toISOString(), src, t, d });
+const author = { id: "7", username: "alice", global_name: "Alice" };
+const M = (id: string, channel: string, extra: any = {}) => ({ id, channel_id: channel, type: 0, content: `msg ${id}`, author, ...extra });
+// Snowflakes: ID1/ID2 on 2026-09-29, ID3 on 2026-09-30 (UTC).
+const ID1 = "1554541602075316245";
+const ID2 = "1554541602075316246";
+const ID3 = "1554900000000000000";
+const THREAD = "1554541602075316300";
+
+const lines: RawLine[] = [
+  line("GUILD_SNAPSHOT", { id: "g", name: "Guild <b>", roles: [] }, 0, "rejgau"),
+  line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0, parent_id: "10", position: 1 }, ancestors: [{ id: "10", name: "Text", type: 4 }] }, 1, "rejgau"),
+  line("CHANNEL_SELECTED", { channel: { id: "12", name: "General", type: 2, position: 2 } }, 2, "rejgau"),
+  line("CHANNEL_SELECTED", { channel: { id: "13", name: "unreadable", type: 0 } }, 3, "rejgau"),
+  line("CHANNEL_SELECTED", { channel: { id: THREAD, name: "a thread", type: 11, parent_id: "11" } }, 4, "rejgau"),
+  line("MESSAGE_CREATE", M(ID1, "11", { content: "hello ||secret||", attachments: [{ id: "3", filename: "p.png", url: "https://cdn.discordapp.com/attachments/11/3/p.png?ex=1", content_type: "image/png" }] }), 5),
+  line("MESSAGE_CREATE", M(ID2, "11", { type: 19, content: "a reply", message_reference: { message_id: ID1, channel_id: "11" }, referenced_message: M(ID1, "11", { content: "hello" }) }), 6),
+  line("MESSAGE_UPDATE", M(ID2, "11", { type: 19, content: "a reply, edited", edited_timestamp: "2026-09-29T12:00:00Z" }), 7),
+  line("MESSAGE_CREATE", M(ID3, "11", { thread: { id: THREAD, name: "a thread" } }), 8),
+  line("MESSAGE_DELETE", { id: ID3, channel_id: "11" }, 9),
+  line("MESSAGE_CREATE", M("1554541602075316400", THREAD, { content: "in thread" }), 10),
+  line("MESSAGE_CREATE", M("1554541602075316500", "12", { content: "voice chat" }), 11),
+  line("MEDIA_STORED", { key: "att-3-p.png", url: "https://github.com/o/r/releases/download/media-2026-09/att-3-p.png" }, 12, "rejgau"),
+];
+const files = buildLogs(fold(lines), { source: "archive@abc1234" });
+
+describe("buildLogs", () => {
+  it("lays out channels, threads and days; skips channels with nothing archived; avoids folder clashes", () => {
+    expect([...files.keys()].sort()).toEqual([
+      "General-12/2026/09/29.md",
+      "General-12/README.md",
+      "README.md",
+      "general/2026/09/29.md",
+      "general/2026/09/29/a-thread.md",
+      "general/2026/09/30.md",
+      "general/README.md",
+    ]);
+    const root = files.get("README.md")!;
+    expect(root).toContain("# Guild \\<b\\>");
+    expect(root).toContain("Rendered by rejgau from the raw logs (`archive@abc1234`).");
+    expect(root).toContain("## Text\n\n- [#general](general/README.md) · 3 messages");
+    expect(files.get("general/README.md")).toContain("- **a thread** · 1 message · [2026-09-29](2026/09/29/a-thread.md)");
+    const thread = files.get("general/2026/09/29/a-thread.md")!;
+    expect(thread).toContain("# 🧵 a thread · 2026-09-29\n\n<sub>thread started 2026-09-29 17:13 UTC · times are UTC</sub>\n\n[#general](../29.md)");
+    expect(files.get("general/2026/09/29.md")).toContain("🧵 [a thread](29/a-thread.md)");
+  });
+
+  it("renders a day with anchors, navigation and archived media; folds messages with spoilers", () => {
+    const day = files.get("general/2026/09/29.md")!;
+    expect(day).toContain("[#general](../../README.md) · [2026-09-30 →](30.md)");
+    expect(day).toContain(`<p align="center"><a id="m${ID1}" href="#m${ID1}"><tt><b>Alice</b> · 17:13</tt></a></p>\n\n<details><summary>Spoiler</summary>\n\nhello ||secret||\n\n![p.png](<https://github.com/o/r/releases/download/media-2026-09/att-3-p.png>)\n\n</details>`);
+  });
+
+  it("links replies to the original, and keeps earlier versions of edited messages", () => {
+    const day = files.get("general/2026/09/29.md")!;
+    expect(day).toContain(`> ↪ replying to **Alice**: [hello](29.md#m${ID1})`);
+    expect(day).toContain("<sub>edited 2026-09-29 12:00 UTC</sub>");
+    expect(day).toContain("<details><summary>1 earlier version</summary>");
+    expect(day).toContain("a reply, edited");
+  });
+
+  it("marks deleted messages and links threads", () => {
+    const day = files.get("general/2026/09/30.md")!;
+    expect(day).toMatch(/🗑 deleted 2026-09-29 \d\d:\d\d UTC/);
+    expect(day).toContain("🧵 [a thread](29/a-thread.md) · 1 message");
+  });
+});
+
+describe("message headers", () => {
+  it("are HTML-escaped (no Markdown inside an HTML block) and carry badges", () => {
+    const files = buildLogs(
+      fold([
+        line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+        line("MESSAGE_CREATE", M(ID1, "11", { author: { id: "8", username: "x", global_name: "<b>&co_*", bot: true } }), 1),
+        line("MESSAGE_CREATE", M(ID2, "11", { type: 7 }), 2),
+      ]),
+    );
+    const day = files.get("general/2026/09/29.md")!;
+    expect(day).toContain(`<tt><b>&lt;b&gt;&amp;co_*</b> <kbd>APP</kbd> · 17:13</tt>`);
+    expect(day).toContain(`<p align="center"><tt>→ <b>Alice</b> joined the server. · <a id="m${ID2}" href="#m${ID2}">17:13</a></tt></p>`);
+  });
+});
+
+describe("threads", () => {
+  it("split by day; a same-day name clash renames only the newer thread, only on that day", () => {
+    const T1 = "1554541602075316300"; // 2026-09-29
+    const T2 = "1554541602075316301";
+    const NEXT_DAY = "1554900000000000000"; // 2026-09-30
+    const files = buildLogs(
+      fold([
+        line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+        line("CHANNEL_SELECTED", { channel: { id: T1, name: "Topic", type: 11, parent_id: "11" } }, 1, "rejgau"),
+        line("CHANNEL_SELECTED", { channel: { id: T2, name: "topic", type: 11, parent_id: "11" } }, 2, "rejgau"),
+        line("MESSAGE_CREATE", M("1554541602075316400", T1), 3),
+        line("MESSAGE_CREATE", M("1554541602075316401", T2), 4),
+        line("MESSAGE_CREATE", M(NEXT_DAY, T2), 5),
+      ]),
+    );
+    expect([...files.keys()].filter((k) => k.includes("/09/")).sort()).toEqual([
+      "general/2026/09/29/Topic.md",
+      `general/2026/09/29/topic-${T2}.md`,
+      "general/2026/09/30/topic.md",
+    ]);
+    expect(files.get(`general/2026/09/29/topic-${T2}.md`)).toContain("[2026-09-30 →](../30/topic.md)");
+  });
+});

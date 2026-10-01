@@ -1,4 +1,5 @@
-# Publishes a rejgau archive as a static site on GitHub Pages.
+# Publishes a rejgau archive: the reader site on GitHub Pages, and human-readable Markdown logs on
+# a branch of their own (default "logs", regenerated as a single commit each time).
 #
 # Put this file on the archive repo's DEFAULT branch (e.g. main) as .github/workflows/pages.yml,
 # and set Settings → Pages → Source to "GitHub Actions". Note that a Pages site is public even
@@ -8,6 +9,7 @@
 #   REJGAU_REF    git ref (ideally a commit SHA) of int19h/rejgau to build with; default: main
 #   ARCHIVE_PATH  folder of the archive inside the branch; default: repo root
 #   ARCHIVE_BRANCH branch the bot writes to; default: archive
+#   LOGS_BRANCH   branch for the rendered logs; default: logs ("none" to skip them)
 #
 # Runs when the bot signals new commits (repository_dispatch, if "pages": true in its config),
 # hourly as a safety net, and on demand.
@@ -27,6 +29,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      source: ${{ steps.source.outputs.source }}
     # Coalesce bursts of updates; the deploy job below is never cancelled mid-way.
     concurrency:
       group: pages-build
@@ -56,6 +60,22 @@ jobs:
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: site
+      - id: source
+        if: vars.LOGS_BRANCH != 'none'
+        env:
+          ARCHIVE_BRANCH: ${{ vars.ARCHIVE_BRANCH || 'archive' }}
+        run: echo "source=$ARCHIVE_BRANCH@$(git -C archive rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - if: vars.LOGS_BRANCH != 'none'
+        run: npm run build:logs -- --archive "../archive/${{ vars.ARCHIVE_PATH }}" --out ../logs --source "$SOURCE"
+        working-directory: rejgau
+        env:
+          SOURCE: ${{ steps.source.outputs.source }}
+      - if: vars.LOGS_BRANCH != 'none'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logs
+          path: logs
+          retention-days: 1
 
   deploy:
     needs: build
@@ -73,3 +93,40 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+
+  logs:
+    needs: build
+    if: vars.LOGS_BRANCH != 'none'
+    runs-on: ubuntu-latest
+    # Only this job can push, and it runs no third-party packages: just git on the build's output.
+    permissions:
+      contents: write
+    concurrency:
+      group: logs-publish
+      cancel-in-progress: false
+    env:
+      LOGS_BRANCH: ${{ vars.LOGS_BRANCH || 'logs' }}
+      SOURCE: ${{ needs.build.outputs.source }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: logs
+          path: logs
+      - name: Push the logs branch (one commit, replacing the previous one)
+        working-directory: logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init -q -b "$LOGS_BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git add -A
+          git commit -q -m "Render logs from $SOURCE"
+          # Skip the push when nothing changed (e.g. the hourly run with no new messages).
+          if git fetch -q --depth=1 origin "$LOGS_BRANCH" 2>/dev/null && [ "$(git rev-parse 'HEAD^{tree}')" = "$(git rev-parse 'FETCH_HEAD^{tree}')" ]; then
+            echo "Logs unchanged."
+          else
+            git push -q --force origin "HEAD:refs/heads/$LOGS_BRANCH"
+          fi

@@ -153,3 +153,28 @@ describe("failure classification", () => {
     discord.failures.delete("/api/v10/guilds/102");
   });
 });
+
+describe("reset", () => {
+  it("wipes buffered lines and state for good, and starts again without waiting for an event", async () => {
+    await stub("109").setPaused(true); // keep the line buffered (background alarms would commit it)
+    await stub("109").ingest("109", events("s9", [["MESSAGE_CREATE", message("1554541602075316700", "11", "buffered before reset", { guild_id: "109" })]], 100));
+    expect((await stub("109").status()).pendingLines).toBeGreaterThan(0);
+    await stub("109").reset().catch(() => {}); // the object aborts itself after wiping
+    const st = await stub("109").status();
+    expect(st).toMatchObject({ paused: false, pendingLines: 0, selectedChannels: 0, lastCommit: null });
+    await runDurableObjectAlarm(stub("109"));
+    expect(committed("109")).not.toContain("buffered before reset");
+
+    const snapshots = () => committed("109").match(/"t":"GUILD_SNAPSHOT"/g)?.length ?? 0;
+    const before = snapshots();
+    expect(await stub("109").start("109")).toEqual({ started: true });
+    expect(await stub("109").flushNow("109")).toMatchObject({ committed: expect.any(Number) });
+    expect(snapshots()).toBe(before + 1);
+    expect(committed("109")).toMatch(/"t":"CHANNEL_SELECTED".*"id":"11"/);
+
+    await stub("109").ingest("109", events("s10", [["MESSAGE_CREATE", message("1554541602075316701", "11", "after reset", { guild_id: "109" })]], 1));
+    await settle("109");
+    expect(committed("109")).toContain("after reset");
+    expect(snapshots()).toBe(before + 1);
+  });
+});

@@ -169,7 +169,7 @@ Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized reques
 | `POST /start`, `POST /stop` | Start the Gateway session (also clears a fatal error, e.g. after fixing the token), or stop it. |
 | `POST /flush[?guild=ID]` | Commit everything buffered now. |
 | `POST /pause[?guild=ID]`, `POST /resume[?guild=ID]` | Stop or restart committing. Events keep being buffered meanwhile. |
-| `POST /reset?guild=ID` | Wipe the bot's state for a guild, so the next event bootstraps and backfills again. For test setups: delete the archive branch first, or the backfill appends duplicates. |
+| `POST /reset?guild=ID` | Wipe the bot's state for a guild and start it again right away: snapshot, channel selection and backfill. For test setups: delete the archive branch first, or the backfill appends duplicates. |
 | `POST /retry-media[?guild=ID]` | Re-queue media recorded as failed, e.g. after fixing the GitHub setup. When a key has several `MEDIA_*` records, the last one wins. |
 
 ## Removing messages from the archive
@@ -200,6 +200,8 @@ npx serve site    # or any static file server
 2. Set **Settings → Pages → Source** to *GitHub Actions*.
 3. Add `"pages": true` to the guild's config so the bot triggers a rebuild after commits. An hourly schedule also covers it.
 
+The same workflow also publishes the [readable logs](#readable-logs) to the `logs` branch.
+
 A Pages site is **public even for a private repo**, except on GitHub Enterprise Cloud with access control. Media stored in a private repo's releases can't be displayed by the reader; it shows as links that signed-in viewers can open.
 
 **Search** understands Discord's syntax:
@@ -211,6 +213,27 @@ A Pages site is **public even for a private repo**, except on GitHub Enterprise 
 - `-` negation and `"phrases"`.
 
 Anything else is case- and accent-insensitive text matching.
+
+## Readable logs
+
+`tools/logs.ts` renders the archive as Markdown that GitHub displays and that reads well in a pager:
+
+```
+README.md                          the server's channels
+<channel>/README.md                the channel's days and threads
+<channel>/2026/09/30.md            the channel's messages on Sep 30 (UTC)
+<channel>/2026/09/30/<thread>.md   a thread's messages on Sep 30
+```
+
+Each message starts with a centred header line that links to itself (`…/30.md#m<message id>`). The Pages workflow regenerates the `logs` branch as a single commit whenever the archive changes; its history isn't kept, since the `archive` branch is the record. So removing something from the archive also removes it from the logs on the next run (replaced commits stay reachable by SHA until GitHub garbage-collects them, as with any rewrite). Set the repository variable `LOGS_BRANCH` to use another branch, or to `none` to turn this off.
+
+To render locally: `npm run build:logs -- --archive ../my-archive --out logs`.
+
+Rendering choices (GitHub strips styles, scripts, video and audio):
+- user text is escaped, so it can't inject HTML or Markdown structure;
+- spoilers fold the whole message into a `<details>` block;
+- custom emoji show as `:name:`, and video, audio and voice messages as links;
+- times are UTC.
 
 ## Development
 

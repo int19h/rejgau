@@ -58,7 +58,8 @@ export default {
         // Destructive: requires naming the guild explicitly.
         if (!post || !guildId) return json({ error: "POST /reset?guild=<id> required" }, 400);
         await archive(guildId).reset().catch(() => {}); // the object aborts itself after wiping
-        return json({ reset: guildId });
+        // Rebuild now rather than on the next event: snapshot, channel selection, backfill.
+        return json({ reset: guildId, ...(await archive(guildId).start(guildId)) });
       }
       case "/retry-media": {
         if (!post) break;
@@ -73,7 +74,7 @@ export default {
         const out: Record<string, unknown> = {};
         for (const id of guilds) {
           const stub = archive(id);
-          if (url.pathname === "/flush") out[id] = await stub.flushNow();
+          if (url.pathname === "/flush") out[id] = await stub.flushNow(id);
           else {
             await stub.setPaused(url.pathname === "/pause");
             out[id] = { paused: url.pathname === "/pause" };
