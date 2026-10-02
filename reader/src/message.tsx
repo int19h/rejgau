@@ -1,7 +1,8 @@
 // Rendering of one archived message: header, content, attachments, embeds, components, polls,
-// stickers, reactions, replies, forwards, app-command headers, edits and deletion.
+// stickers, reactions, replies, forwards, and app-command headers.
 
 import type { ComponentChildren } from "preact";
+import type { Attachment, Component as PublishedComponent, Embed as PublishedEmbed, Emoji, MessageBody, PublishedMessage, Reaction, Sticker } from "../../shared/publication";
 import { useState } from "preact/hooks";
 import { avatarRef, emojiRef, memberAvatarRef, refForUrl, stickerRef } from "../../src/media";
 import { displayName, hexColor, monthOfId, NORMAL_TYPES, roleColor, SYSTEM_TEXT, type Archive, type MonthFile, type UserSnap, type UsersFile } from "./data";
@@ -18,7 +19,7 @@ export interface MsgEnv {
 // Archived media URLs come from the (hand-editable) raw log, so they're checked like any other URL.
 const media = (env: MsgEnv, key: string | undefined) => (key ? safeUrl(env.file.media[key] ?? env.users?.media[key]) : null);
 
-function mdContext(env: MsgEnv, msg: any): MdContext {
+function mdContext(env: MsgEnv, msg: PublishedMessage): MdContext {
   const roles = env.archive.guild.roles;
   const mentionSnaps = new Map<string, UserSnap>();
   for (const k of msg.mentions ?? []) {
@@ -82,8 +83,8 @@ function Time({ iso, withDate }: { iso: string; withDate?: boolean }) {
   );
 }
 
-function isSpoilerAttachment(a: any): boolean {
-  return !!(a.flags & 8) || !!a.is_spoiler || String(a.filename ?? "").startsWith("SPOILER_");
+function isSpoilerAttachment(a: Attachment): boolean {
+  return !!((a.flags ?? 0) & 8) || !!a.is_spoiler || String(a.filename ?? "").startsWith("SPOILER_");
 }
 
 function Blur({ spoiler, children }: { spoiler: boolean; children: ComponentChildren }) {
@@ -97,7 +98,7 @@ function Blur({ spoiler, children }: { spoiler: boolean; children: ComponentChil
   );
 }
 
-function MediaItem({ url, type, name, env, width, height, alt, spoiler }: { url?: string; type?: string; name?: string; env: MsgEnv; width?: number; height?: number; alt?: string; spoiler?: boolean }) {
+function MediaItem({ url, type, name, env, width, height, alt, spoiler }: { url?: string; type?: string; name?: string; env: MsgEnv; width?: number | null; height?: number | null; alt?: string; spoiler?: boolean }) {
   const [failed, setFailed] = useState(false);
   const ref = url ? refForUrl(url) : null;
   const archived = ref ? media(env, ref.key) : null;
@@ -118,7 +119,7 @@ function MediaItem({ url, type, name, env, width, height, alt, spoiler }: { url?
         <span class="file-name">{name ?? alt ?? "media"}</span> <span class="muted small">(open)</span>
       </a>
     );
-  } else if (isImage) el = <img class="media" src={archived} alt={alt ?? name ?? ""} loading="lazy" width={width} height={height} onError={() => setFailed(true)} />;
+  } else if (isImage) el = <img class="media" src={archived} alt={alt ?? name ?? ""} loading="lazy" width={width ?? undefined} height={height ?? undefined} onError={() => setFailed(true)} />;
   else if (ct.startsWith("video/")) el = <video class="media" src={archived} controls preload="metadata" />;
   else if (ct.startsWith("audio/")) el = <audio src={archived} controls preload="metadata" />;
   else
@@ -130,7 +131,7 @@ function MediaItem({ url, type, name, env, width, height, alt, spoiler }: { url?
   return <Blur spoiler={!!spoiler}>{el}</Blur>;
 }
 
-function Attachments({ list, env }: { list: any[]; env: MsgEnv }) {
+function Attachments({ list, env }: { list: Attachment[]; env: MsgEnv }) {
   return (
     <div class="attachments">
       {list.map((a) => (
@@ -140,10 +141,10 @@ function Attachments({ list, env }: { list: any[]; env: MsgEnv }) {
   );
 }
 
-function Embed({ e, env, ctx }: { e: any; env: MsgEnv; ctx: MdContext }) {
+function Embed({ e, env, ctx }: { e: PublishedEmbed; env: MsgEnv; ctx: MdContext }) {
   const imageOnly = (e.type === "image" || e.type === "gifv") && (e.thumbnail || e.image);
   if (imageOnly) {
-    const img = e.image ?? e.thumbnail;
+    const img = (e.image ?? e.thumbnail)!;
     return <MediaItem url={img.url} type={img.content_type ?? "image/"} name={safeUrl(e.url) ?? undefined} env={env} width={img.width} height={img.height} />;
   }
   const color = hexColor(e.color);
@@ -157,9 +158,9 @@ function Embed({ e, env, ctx }: { e: any; env: MsgEnv; ctx: MdContext }) {
         )}
         {e.title && <div class="embed-title">{url ? <a href={url} target="_blank" rel="noopener noreferrer">{e.title}</a> : e.title}</div>}
         {e.description && <Markdown text={e.description} ctx={ctx} />}
-        {e.fields?.length > 0 && (
+        {e.fields && e.fields.length > 0 && (
           <div class="embed-fields">
-            {e.fields.map((f: any, i: number) => (
+            {e.fields.map((f, i) => (
               <div key={i} class={f.inline ? "embed-field inline" : "embed-field"}>
                 <div class="embed-field-name"><Markdown text={f.name ?? ""} ctx={ctx} /></div>
                 <div class="embed-field-value"><Markdown text={f.value ?? ""} ctx={ctx} /></div>
@@ -184,7 +185,7 @@ function Embed({ e, env, ctx }: { e: any; env: MsgEnv; ctx: MdContext }) {
 
 const BUTTON_STYLES = ["", "primary", "secondary", "success", "danger", "link", "premium"];
 
-function ComponentEmoji({ emoji, ctx }: { emoji: any; ctx: MdContext }) {
+function ComponentEmoji({ emoji, ctx }: { emoji?: Emoji; ctx: MdContext }) {
   const [failed, setFailed] = useState(false);
   if (!emoji) return null;
   if (emoji.id) {
@@ -194,8 +195,8 @@ function ComponentEmoji({ emoji, ctx }: { emoji: any; ctx: MdContext }) {
   return <span>{emoji.name}</span>;
 }
 
-function Component({ c, env, ctx }: { c: any; env: MsgEnv; ctx: MdContext }): any {
-  const kids = (list: any[] | undefined) => (list ?? []).map((x, i) => <Component key={i} c={x} env={env} ctx={ctx} />);
+function Component({ c, env, ctx }: { c: PublishedComponent; env: MsgEnv; ctx: MdContext }): ComponentChildren {
+  const kids = (list: PublishedComponent[] | undefined) => (list ?? []).map((x, i) => <Component key={i} c={x} env={env} ctx={ctx} />);
   switch (c.type) {
     case 1:
       return <div class="action-row">{kids(c.components)}</div>;
@@ -208,9 +209,9 @@ function Component({ c, env, ctx }: { c: any; env: MsgEnv; ctx: MdContext }): an
         </>
       );
       return href ? (
-        <a class={`button ${BUTTON_STYLES[c.style] ?? ""}`} href={href} target="_blank" rel="noopener noreferrer">{body}</a>
+        <a class={`button ${BUTTON_STYLES[c.style ?? 0] ?? ""}`} href={href} target="_blank" rel="noopener noreferrer">{body}</a>
       ) : (
-        <button class={`button ${BUTTON_STYLES[c.style] ?? ""}`} disabled>{body}</button>
+        <button class={`button ${BUTTON_STYLES[c.style ?? 0] ?? ""}`} disabled>{body}</button>
       );
     }
     case 3:
@@ -233,7 +234,7 @@ function Component({ c, env, ctx }: { c: any; env: MsgEnv; ctx: MdContext }): an
     case 12:
       return (
         <div class="gallery">
-          {(c.items ?? []).map((it: any, i: number) => (
+          {(c.items ?? []).map((it, i) => (
             <MediaItem key={i} url={it.media?.url} type={it.media?.content_type} alt={it.description} env={env} spoiler={!!it.spoiler} width={it.media?.width} height={it.media?.height} />
           ))}
         </div>
@@ -255,11 +256,11 @@ function Component({ c, env, ctx }: { c: any; env: MsgEnv; ctx: MdContext }): an
   }
 }
 
-function Poll({ msg, ctx }: { msg: any; ctx: MdContext }) {
-  const p = msg.poll;
+function Poll({ msg, ctx, env }: { msg: PublishedMessage; ctx: MdContext; env: MsgEnv }) {
+  const p = msg.poll!;
   const counts: Record<string, number> = {};
   for (const a of p.results?.answer_counts ?? []) counts[a.id] = a.count;
-  for (const [id, v] of Object.entries<any>(msg.votes ?? {})) counts[id] = v.count;
+  for (const [id, v] of Object.entries(msg.votes ?? {})) counts[id] = v.count;
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
   // With multiple answers per voter, percentages of all votes would mislead; Discord divides by
   // voters, which we only partly know. Show counts only.
@@ -268,11 +269,12 @@ function Poll({ msg, ctx }: { msg: any; ctx: MdContext }) {
   return (
     <div class="poll">
       <div class="poll-question">{p.question?.text}</div>
-      {(p.answers ?? []).map((a: any) => {
+      {(p.answers ?? []).map((a) => {
         const n = counts[a.answer_id] ?? 0;
         const pct = total ? Math.round((n / total) * 100) : 0;
+        const voters = (msg.votes?.[a.answer_id]?.users ?? []).map((id) => env.users?.users[id] ? displayName(env.users.users[id]) : `User ${id}`);
         return (
-          <div key={a.answer_id} class="poll-answer">
+          <div key={a.answer_id} class="poll-answer" title={voters.length ? `Known voters: ${voters.join(", ")}` : undefined}>
             <div class="poll-bar" style={{ width: `${pct}%` }} />
             <span class="poll-label">
               <ComponentEmoji emoji={a.poll_media?.emoji} ctx={ctx} /> {a.poll_media?.text}
@@ -288,7 +290,7 @@ function Poll({ msg, ctx }: { msg: any; ctx: MdContext }) {
   );
 }
 
-function Stickers({ list, env }: { list: any[]; env: MsgEnv }) {
+function Stickers({ list, env }: { list: Sticker[]; env: MsgEnv }) {
   return (
     <div class="stickers">
       {list.map((s) => {
@@ -300,7 +302,7 @@ function Stickers({ list, env }: { list: any[]; env: MsgEnv }) {
   );
 }
 
-function Reactions({ list, env, ctx }: { list: any[]; env: MsgEnv; ctx: MdContext }) {
+function Reactions({ list, env, ctx }: { list: Reaction[]; env: MsgEnv; ctx: MdContext }) {
   return (
     <div class="reactions">
       {list.map((r, i) => {
@@ -315,25 +317,24 @@ function Reactions({ list, env, ctx }: { list: any[]; env: MsgEnv; ctx: MdContex
   );
 }
 
-function Body({ m, msg, env, ctx }: { m: any; msg: any; env: MsgEnv; ctx: MdContext }) {
+function Body({ m, msg, env, ctx }: { m: MessageBody; msg: PublishedMessage; env: MsgEnv; ctx: MdContext }) {
   return (
     <>
       {m.content ? <Markdown text={m.content} ctx={ctx} /> : null}
-      {m.components?.length > 0 && <div class="components">{m.components.map((c: any, i: number) => <Component key={i} c={c} env={env} ctx={ctx} />)}</div>}
-      {m.attachments?.length > 0 && <Attachments list={m.attachments} env={env} />}
-      {m.embeds?.map((e: any, i: number) => <Embed key={i} e={e} env={env} ctx={ctx} />)}
-      {m.sticker_items?.length > 0 && <Stickers list={m.sticker_items} env={env} />}
-      {msg.poll && m === msg && <Poll msg={msg} ctx={ctx} />}
+      {m.components && m.components.length > 0 && <div class="components">{m.components.map((c, i) => <Component key={i} c={c} env={env} ctx={ctx} />)}</div>}
+      {m.attachments && m.attachments.length > 0 && <Attachments list={m.attachments} env={env} />}
+      {m.embeds?.map((e, i) => <Embed key={i} e={e} env={env} ctx={ctx} />)}
+      {m.sticker_items && m.sticker_items.length > 0 && <Stickers list={m.sticker_items} env={env} />}
+      {msg.poll && m === msg && <Poll msg={msg} ctx={ctx} env={env} />}
     </>
   );
 }
 
-export function Message({ msg, env, grouped, highlighted }: { msg: any; env: MsgEnv; grouped: boolean; highlighted: boolean }) {
-  const [showEdits, setShowEdits] = useState(false);
+export function Message({ msg, env, grouped, highlighted }: { msg: PublishedMessage; env: MsgEnv; grouped: boolean; highlighted: boolean }) {
   const ctx = mdContext(env, msg);
   const author = msg.author ? env.file.users[msg.author] : undefined;
   const guildId = env.archive.guild.id;
-  const cls = ["message", grouped ? "grouped" : "", msg.deleted_at ? "deleted" : "", highlighted ? "highlight" : ""].filter(Boolean).join(" ");
+  const cls = ["message", grouped ? "grouped" : "", highlighted ? "highlight" : ""].filter(Boolean).join(" ");
   const anchor = `#/c/${env.channelId}/${monthOfId(msg.id)}/${msg.id}`;
 
   if (!NORMAL_TYPES.has(msg.type)) {
@@ -348,7 +349,7 @@ export function Message({ msg, env, grouped, highlighted }: { msg: any; env: Msg
   }
 
   const referenced = msg.referenced;
-  const refUser = referenced?.author ? env.file.users[referenced.author] : undefined;
+  const refUser = referenced && !referenced.deleted && referenced.author ? env.file.users[referenced.author] : undefined;
   const inter = msg.interaction;
   const interUser = inter?.user ? env.file.users[inter.user] : undefined;
   const forwards = msg.message_snapshots ?? [];
@@ -395,36 +396,17 @@ export function Message({ msg, env, grouped, highlighted }: { msg: any; env: Msg
               {msg.pinned && <span class="muted small" title="Pinned">📌</span>}
             </div>
           )}
-          {msg.flags & 128 && !msg.content && !msg.components?.length && !msg.embeds?.length ? <div class="muted">{displayName(author)} is thinking…</div> : null}
+          {(msg.flags ?? 0) & 128 && !msg.content && !msg.components?.length && !msg.embeds?.length ? <div class="muted">{displayName(author)} is thinking…</div> : null}
           <Body m={msg} msg={msg} env={env} ctx={ctx} />
-          {forwards.map((s: any, i: number) => (
+          {forwards.map((s, i) => (
             <div key={i} class="forward">
               <div class="muted small">↱ Forwarded</div>
               <Body m={s.message ?? {}} msg={msg} env={env} ctx={ctx} />
               {s.message?.timestamp && <div class="muted small"><Time iso={s.message.timestamp} withDate /></div>}
             </div>
           ))}
-          {(msg.edited_timestamp || msg.deleted_at) && (
-            <div class="meta">
-              {msg.edited_timestamp && (
-                <button class="linklike muted small" onClick={() => setShowEdits(!showEdits)} title={new Date(msg.edited_timestamp).toLocaleString()} disabled={!msg.edits?.length}>
-                  (edited{msg.edits?.length ? `, ${msg.edits.length} earlier version${msg.edits.length > 1 ? "s" : ""}` : ""})
-                </button>
-              )}
-              {msg.deleted_at && <span class="deleted-badge" title={`Deleted ${new Date(msg.deleted_at).toLocaleString()}`}>deleted</span>}
-            </div>
-          )}
-          {showEdits && (
-            <div class="edits">
-              {msg.edits.map((e: any, i: number) => (
-                <div key={i} class="edit">
-                  <div class="muted small">Version from <Time iso={e.ts} withDate /></div>
-                  <Body m={e} msg={{}} env={env} ctx={ctx} />
-                </div>
-              ))}
-            </div>
-          )}
-          {msg.reactions?.length > 0 && <Reactions list={msg.reactions} env={env} ctx={ctx} />}
+          {msg.edited_timestamp && <div class="meta"><span class="muted small" title={new Date(msg.edited_timestamp).toLocaleString()}>(edited)</span></div>}
+          {msg.reactions && msg.reactions.length > 0 && <Reactions list={msg.reactions} env={env} ctx={ctx} />}
           {msg.thread && (
             <a class="thread-link" href={`#/c/${msg.thread.id}`}>
               🧵 {msg.thread.name ?? "Thread"} <span class="muted">· {msg.thread.count} message{msg.thread.count === 1 ? "" : "s"}</span>
@@ -437,14 +419,13 @@ export function Message({ msg, env, grouped, highlighted }: { msg: any; env: Msg
 }
 
 /** Discord-style grouping: same author, within 7 minutes, same day, no reply/command header. */
-export function isGrouped(prev: any | undefined, msg: any, file: MonthFile): boolean {
+export function isGrouped(prev: PublishedMessage | undefined, msg: PublishedMessage, file: MonthFile): boolean {
   if (!prev || !NORMAL_TYPES.has(prev.type) || !NORMAL_TYPES.has(msg.type)) return false;
   if (msg.referenced || msg.interaction || msg.type !== 0) return false;
-  const a = file.users[prev.author]?.id;
-  const b = file.users[msg.author]?.id;
-  if (!a || a !== b) return false;
+  // A snapshot key changes when the displayed sender identity changes.
+  if (!msg.author || prev.author !== msg.author || !file.users[msg.author]) return false;
   const t0 = Date.parse(prev.ts);
   const t1 = Date.parse(msg.ts);
-  if (t1 - t0 > 7 * 60_000) return false;
+  if (t1 < t0 || t1 - t0 > 7 * 60_000) return false;
   return new Date(t0).toDateString() === new Date(t1).toDateString();
 }

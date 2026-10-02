@@ -2,18 +2,8 @@
 
 import { normalizeText } from "./text";
 
-export interface SearchRow {
-  id: string;
-  c: string;
-  ts: string;
-  a?: string;
-  text: string;
-  at: "user" | "bot" | "webhook";
-  has?: string[];
-  men?: string[];
-  pin?: boolean;
-  del?: boolean;
-}
+import type { SearchRow } from "../../shared/publication";
+export type { SearchRow } from "../../shared/publication";
 
 export const FILTER_KEYS = ["from", "mentions", "in", "has", "before", "after", "during", "pinned", "authortype"] as const;
 type FilterKey = (typeof FILTER_KEYS)[number];

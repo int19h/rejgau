@@ -1,87 +1,96 @@
-// Loading the build's data files, plus helpers shared by views.
+// Data loading and helpers for the archive reader.
 
-export interface UserSnap {
-  id: string;
-  username?: string;
-  global_name?: string | null;
-  avatar?: string | null;
-  bot?: boolean;
-  system?: boolean;
-  nick?: string | null;
-  member_asof?: "backfill";
-  member_avatar?: string | null;
-  roles?: string[];
-  tag?: string | null;
-  names?: string[];
-}
+import {
+  parseArchive, parseMonthFile, parseSearchRows, parseUsersFile,
+  type Archive, type MonthFile, type Role, type SearchRow, type UserSnap, type UsersFile,
+} from "../../shared/publication";
+import { BoundedCache } from "./cache";
 
-export interface ChannelInfo {
-  id: string;
-  name?: string;
-  type: number;
-  parent_id: string | null;
-  position: number;
-  topic?: string;
-  nsfw?: boolean;
-  deleted?: boolean;
-  archived?: boolean;
-  created?: string | null;
-  months: Record<string, number>;
-}
+export type { Archive, ChannelInfo, MonthFile, Role, UserSnap, UsersFile } from "../../shared/publication";
 
-export interface Role {
-  id: string;
-  name: string;
-  color?: number;
-  colors?: { primary_color?: number };
-  position: number;
-}
+export const MAX_JSON_BYTES = 32 * 1024 * 1024;
+export const CACHE_BYTES = 16 * 1024 * 1024;
+export const CACHE_ENTRIES = 12;
+const cache = new BoundedCache<unknown>(CACHE_ENTRIES, CACHE_BYTES);
 
-export interface Archive {
-  format: number;
-  built_at: string;
-  guild: { id: string; name: string; icon_url: string | null; roles: Role[]; emojis: any[]; stickers: any[] };
-  channels: Record<string, ChannelInfo>;
-  search_months: string[];
-}
-
-export interface MonthFile {
-  channel: string;
-  month: string;
-  media: Record<string, string | null>;
-  users: Record<string, UserSnap>;
-  messages: any[];
-}
-
-export interface UsersFile {
-  users: Record<string, UserSnap>;
-  media: Record<string, string | null>;
-}
-
-const BASE = "data/";
-const cache = new Map<string, Promise<any>>();
-
-function load<T>(path: string, init?: RequestInit): Promise<T> {
-  let p = cache.get(path);
-  if (!p) {
-    p = fetch(BASE + path, init).then((r) => {
-      if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
-      return r.json();
-    });
-    p.catch(() => cache.delete(path));
-    cache.set(path, p);
+export class DataError extends Error {
+  constructor(message: string, readonly reload = false) {
+    super(message);
+    this.name = "DataError";
   }
-  return p;
 }
 
-// Hosts like GitHub Pages let browsers cache files for a while (10 minutes there). archive.json is
-// always revalidated, and every other file is requested for that build (?v=<built_at>), so a new
-// deploy is seen at once and never mixed with cached files from an older one.
-export const loadArchive = () => load<Archive>("archive.json", { cache: "no-cache" });
-const loadBuild = async <T>(path: string) => load<T>(`${path}?v=${encodeURIComponent((await loadArchive()).built_at)}`);
-export const loadUsers = () => loadBuild<UsersFile>("users.json");
-export const loadMonth = (channel: string, month: string) => loadBuild<MonthFile>(`c/${channel}/${month}.json`);
-export const loadSearchMonth = (month: string) => loadBuild<any[]>(`search/${month}.json`);
+async function readJson(path: string, signal?: AbortSignal, reloadOnMissing = false, refresh = false): Promise<{ value: unknown; bytes: number }> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  const timeout = setTimeout(() => controller.abort(new Error("The data request timed out. Try again.")), 30_000);
+  try {
+    const response = await fetch(`data/${path}`, { signal: controller.signal, ...(refresh ? { cache: "no-cache" as const } : {}) });
+    if (!response.ok) {
+      if (response.status === 404 && reloadOnMissing) throw new DataError("The archive changed. Reload the archive to continue.", true);
+      throw new DataError(`The data request failed (HTTP ${response.status}). Try again.`);
+    }
+    if (!response.body) throw new DataError("The data response is empty. Try again.");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    let text = "";
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        bytes += chunk.value.byteLength;
+        if (bytes > MAX_JSON_BYTES) {
+          await reader.cancel();
+          throw new DataError("This archive data file exceeds the 32 MiB reader limit. The publisher must split the file.");
+        }
+        text += decoder.decode(chunk.value, { stream: true });
+      }
+      text += decoder.decode();
+    } finally {
+      reader.releaseLock();
+    }
+    return { value: JSON.parse(text) as unknown, bytes };
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+export async function loadArchive(signal?: AbortSignal): Promise<Archive> {
+  return parseArchive((await readJson("archive.json", signal, false, true)).value);
+}
+
+function dataPath(archive: Archive, path: string): string {
+  if (archive.data_root) return `${archive.data_root}${path}`;
+  return `${path}?v=${encodeURIComponent(archive.built_at)}`;
+}
+
+async function loadBuild<T>(archive: Archive, path: string, parse: (value: unknown) => T, signal?: AbortSignal, retain = true): Promise<T> {
+  const key = dataPath(archive, path);
+  const previous = cache.get(key);
+  if (previous !== undefined) return previous as T;
+  const result = await readJson(key, signal, !!archive.data_root);
+  const value = parse(result.value);
+  if (retain && !signal?.aborted) cache.set(key, value, result.bytes);
+  return value;
+}
+
+export const loadUsers = (archive: Archive, signal?: AbortSignal): Promise<UsersFile> =>
+  loadBuild(archive, "users.json", parseUsersFile, signal, false);
+
+export async function loadMonth(archive: Archive, channel: string, month: string, signal?: AbortSignal): Promise<MonthFile> {
+  return loadBuild(archive, `c/${channel}/${month}.json`, (value) => {
+    const file = parseMonthFile(value);
+    if (file.channel !== channel || file.month !== month) throw new DataError("The message file does not match this channel and month.");
+    return file;
+  }, signal);
+}
+
+export const loadSearchMonth = (archive: Archive, month: string, signal?: AbortSignal): Promise<SearchRow[]> =>
+  loadBuild(archive, `search/${month}.json`, parseSearchRows, signal);
 
 const DISCORD_EPOCH = 1420070400000n;
 export const snowflakeTime = (id: string) => Number((BigInt(id) >> 22n) + DISCORD_EPOCH);
