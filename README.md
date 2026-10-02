@@ -114,6 +114,8 @@ npm run deploy
 
 The deployment command requires a clean Git checkout. It records the full commit ID on the Worker version.
 
+If Cloudflare lists multiple accounts, set `CLOUDFLARE_ACCOUNT_ID` to the intended account before deployment.
+
 For a local bundle without deployment, run `npm run deploy -- --dry-run --outdir /tmp/rejgau-worker`.
 
 Then, in the Cloudflare dashboard, go to **Workers & Pages → rejgau → Settings → Variables and Secrets** and add:

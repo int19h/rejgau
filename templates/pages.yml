@@ -99,6 +99,7 @@ jobs:
         with:
           name: logs
           path: logs
+          include-hidden-files: true
           retention-days: 1
 
   deploy:

@@ -108,9 +108,17 @@ This removal keeps deleted content out of stale generated directories. A browser
 
 Each file rename changes one directory entry in one operation. The full directory replacement requires several filesystem operations.
 Caught failures restore prior owned files. A later build can recover an interrupted journal after the recorded process exits.
+The builder saves the complete, bounded recovery plan before it changes output files.
+
+A `.guard` file allows only one process to recover an output directory at a time.
+If recovery stops during this step, the builder refuses automatic guard removal.
+Make sure that no builder uses the destination. Make sure that the recorded process is absent.
+Then remove only the reported guard file.
+Keep the journal and backup files for the next build to recover.
 
 The publisher limits generated inventory to 100,000 entries and 512 MiB. It rejects symbolic links and paths outside the reserved output tree.
-Metadata files also have bounded reads. A lock prevents concurrent builders from promoting into the same destination.
+Ownership and recovery metadata each have a 32 MiB limit for reads and writes.
+A lock prevents concurrent builders from promoting into the same destination.
 
 These safeguards support a trusted local checkout. They do not provide a database transaction for concurrent readers or a hostile local filesystem writer.
 A completed site directory is the deployment artifact. Uploading that artifact remains separate from constructing it.
