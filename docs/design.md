@@ -1,254 +1,184 @@
-# rejgau: design
+# rejgau architecture
 
-rejgau archives selected channels of a Discord server into a git repository. It also ships a static, Discord-like reader with search.
+rejgau records selected Discord events in Git and stores their media in GitHub release assets.
+A Cloudflare Worker collects events. Separate local tools generate a static reader and Markdown logs from the raw archive.
 
-Status: design agreed; feasibility spike done (see [Spike results](#spike-results-2026-09-29)). Research date: 2026-09-29.
+The raw archive retains message edits and deletion events. Generated views contain current, undeleted messages from selected channels.
+The [reader design](reader.md) describes publication files, browser behavior, and local build limits. The [README](../README.md) contains deployment and operator commands.
 
-## Goals and non-goals
+## Components and state
 
-**Goals**
-- Keep a verbatim raw record of everything the bot can observe in the selected channels. This includes metadata, edits, deletes, reactions, polls, threads, and responses from other apps.
-- Make the archive outlive its operator. Logs and media live on the git host (GitHub first), not in the operator's paid infrastructure. The bot is just a writer.
-- Provide a static reader that works from GitHub Pages. It renders messages close to how Discord does, read-only, and supports Discord search syntax.
-- Keep the code generic, so anyone can run their own deployment.
+A guild is a Discord server. Each configured guild has one `GuildArchive` Durable Object, which stores persistent state and buffered events.
+One `GatewaySession` Durable Object manages the bot connection and routes events to those guild objects.
 
-**Non-goals, for now**
-- Multi-tenant hosting. One deployment serves a handful of servers (1 main, 1 test, maybe 3–5 more), with well under 10k users in total. At that size the Message Content intent is a toggle in the developer portal, with no review.
-- Git hosts other than GitHub. The writer sits behind an adapter interface so GitLab and Forgejo can be added later.
-- Automated deletion or opt-out handling. Deletions are done by hand by the archive admin, who is also the Discord server admin; see [History rewrites](#history-rewrites-by-the-admin). The server rules say so. The bot records `MESSAGE_DELETE` events like any other event, but does not redact anything itself.
-- A GitHub Discussions mirror. It was considered and deferred.
+| Module | Responsibility |
+| --- | --- |
+| `src/index.ts`, `src/admin.ts` | Worker entry points, authenticated operator routes, scheduled recovery |
+| `src/gateway.ts` | WebSocket connection, session recovery, heartbeats, delivery scheduling |
+| `src/gateway-outbox.ts` | Durable event order, retries, quarantine, exact-event recovery |
+| `src/discord.ts`, `src/discord-limits.ts` | Discord REST requests and shared retry deadlines |
+| `src/archive.ts` | Channel selection, permission refresh, event handling, history recovery |
+| `src/archive-lifecycle.ts` | Ordering for ingestion, background work, pause, and reset |
+| `src/archive-storage.ts` | Archive tables, indexes, and bounded reads of pending events |
+| `src/archive-committer.ts` | Bounded Git commits and blocked-file diagnostics |
+| `src/archive-media.ts` | Durable media jobs and release inventory |
+| `src/github.ts`, `src/http.ts` | GitHub requests, authentication, deadlines, and bounded body reads |
+| `src/channels.ts`, `src/sanitize.ts` | Visibility decisions and removal of private fields |
+| `tools/fold.ts`, `shared/publication.ts` | Current message state and generated data contracts |
 
-## Architecture
+Cloudflare stores delivery queues, permission state, history cursors, and pending uploads. GitHub stores committed raw records and uploaded media.
+A database transaction connects each accepted Gateway sequence with its queued events. A restart can replay delivery, so consumers remove duplicate Gateway records.
 
+## Gateway delivery and recovery
+
+The outbox is a durable queue of undelivered events. Each guild preserves its own event order.
+The delivery scheduler serves up to four guilds concurrently, with at most 100 events in one batch.
+A slow guild does not block delivery to other guilds.
+
+An archive response reports the accepted prefix and the first failure. The Gateway removes only accepted events.
+Transient failures retain the remaining events and store an absolute retry deadline.
+An explicit future deadline defers work without increasing the failure count.
+
+Retries without a server deadline use increasing delays, from five seconds to five minutes.
+Retryable failures do not become permanent losses after an arbitrary attempt count.
+The earliest connection or delivery deadline determines the next alarm. Heartbeat handling does not wait for guild ingestion.
+
+Quarantine is a blocked event kept for repair. A nonretryable failure moves the event into quarantine and blocks later delivery for that guild.
+Other guilds continue. Operator routes list summaries without event payloads and retry one exact guild/event pair.
+
+Recovery preserves the original event order. Only the earliest recoverable event for that guild can return to the outbox.
+Legacy dead letters lack this guarantee because later events already advanced archive state. Automatic retry refuses those legacy records.
+
+The Gateway persists its desired running state. An explicit stop survives scheduled recovery and object reconstruction.
+An explicit start clears the stop and fatal connection state. Connection attempts carry an identity guard, so an obsolete attempt cannot reopen a stopped session.
+
+Stop closes the Gateway connection and cancels a pending connection attempt. Already queued deliveries can still drain.
+Pause controls archive background work separately. A stop therefore does not replace a pause during an archive rewrite.
+
+The bot resumes a saved Discord session when possible. An invalid session causes a new connection and REST recovery for selected channels.
+REST recovery finds later messages, but it cannot reconstruct every missed edit, deletion, or reaction.
+
+## Discord access and request limits
+
+Channel selection combines repository configuration with Discord permissions. A channel must match the selection and remain visible to the bot.
+Category selections include their descendants. Threads follow their parent selection, and private threads require the explicit `privateThreads` setting.
+
+The permission model uses the bot roles and channel overwrites. Administrator permission gives the bot access despite channel denies.
+The archive waits for a known permission state before selecting channels. Permission changes trigger selection updates.
+
+A complete guild snapshot marks absent non-thread channels as missing and unselects them.
+A later channel event restores their presence before selection is reconsidered. Missing threads remain distinct because an active-thread list omits archived threads.
+
+A cooldown is a required wait before another request. Discord REST callers share cooldown state in `GatewaySession` storage.
+A bucket groups requests that share one limit. The coordinator records global deadlines, route deadlines, and server bucket identifiers.
+Bucket keys retain the major guild or channel identity. A deadline extends existing state and never shortens a prior wait.
+Expired cooldowns and unused bucket aliases leave storage through bounded periodic cleanup.
+
+A `429` response supplies a future retry time to the caller. A successful response with no remaining requests also records its reset deadline.
+History, member, permission, and attachment jobs persist these deferrals. They do not sleep inside a request until the deadline expires.
+
+Gateway connection attempts have a 30-second timeout. The shared HTTP helper also gives Discord and GitHub operations a 30-second deadline.
+The deadline includes response headers and body consumption. This bounds stalls while reading a media source or awaiting an upload response.
+
+## Archive lifecycle
+
+Ingestion and background work have separate ordered queues. Ingestion can keep recording events while background work waits on external services.
+A reset uses an exclusive barrier that waits for both queues. This prevents old work from repopulating state after reset.
+
+Pause persists the paused flag before it waits for active background work. Its response means that the existing background operation finished.
+New Gateway events still enter the raw buffer while paused. Automatic history, member, media, dispatch, and commit work remain suspended.
+
+An explicit flush waits for earlier background work. It captures a pending-event cutoff and processes bounded batches through that cutoff.
+Its result reports `committed`, `remaining`, and `complete`. Newer arrivals do not make that result ambiguous.
+
+A flush with remaining or blocked rows reports incomplete work. The HTTP route returns failure status instead of treating that result as a completed flush.
+Repeated explicit flushes can continue a large drain. Status retains the reason for blocked paths.
+
+Reset deletes the guild buffer, selection state, cursors, media jobs, and blocked-path records in one storage transaction.
+It then clears in-memory state and completes normally. Reset does not delete the GitHub archive or release assets.
+Starting again initializes selection and history recovery, so a reset can duplicate history that already exists in Git.
+
+## Raw records and privacy
+
+The raw format marker is separate from the reader format marker. Current raw archives use format 2.
+The builders also accept the earlier daily raw-file layout. Dates and file partitions use UTC.
+
+```text
+archive.json
+raw/YYYY/MM/DD/guild.jsonl
+raw/YYYY/MM/DD/<channel-id>.jsonl
 ```
-Discord Gateway ──ws──► Cloudflare Worker "rejgau" (workers.dev, Workers Paid)
-                         ├─ DO GatewaySession   one per bot: socket, heartbeat alarm, resume, routing
-                         ├─ DO GuildArchive     one per guild: SQLite buffer + state, flush alarm,
-                         │                      commits via GitHub App (Git Data API)
-                         │                      and uploads media as release assets
-                         ├─ /status, /flush     admin HTTP endpoints (ADMIN_KEY)
-                         └─ cron */5            ensures the Gateway session is running
 
-GitHub: <server>-archive (public or private)
-  branch main      README (+ later: Pages workflow)
-  branch archive   the logs; see "Archive layout". Written only by the bot; may be force-pushed by the admin.
-  releases         media-YYYY-MM[.n]: attachments, avatars, emoji and stickers as release assets
-  pages            reader + archive data, deployed by Actions on push to `archive`
-```
+Each JSONL file contains one JSON record per line. A record carries `at`, `src`, `t`, and `d`.
+Gateway records also carry a public session identifier and a sequence number. Public session identifiers replace the actual Discord session identifier.
 
-### Cloudflare
+`src` distinguishes Gateway events, REST snapshots, and synthetic archive records. REST messages retain their fetch time in `at`.
+Their file location follows message creation time. Synthetic records include selection changes, guild snapshots, recovery markers, and media results.
 
-- **Plan: Workers Paid ($5/month).** The existing personal account appears to be on it already.
-  - The Gateway connection is an *outbound* WebSocket, which cannot hibernate. The Durable Object therefore stays resident: 128 MB × 86,400 s = 10,800 GB-s per day, about 330k GB-s per month. That is inside the 400k GB-s per month the plan includes.
-  - The free plan would also fit that duration, but its limits are too tight: 10 ms CPU per event, 50 subrequests per invocation, and 100k SQLite row writes per day.
-- **Liveness**
-  - An open outbound socket protects a Durable Object from eviction for only 15 minutes. So a self-rescheduling alarm sends each heartbeat (interval ≈ 41 s) and acts as the watchdog.
-  - Deploys and runtime updates restart the Durable Object.
-  - `session_id`, `resume_gateway_url` and `seq` are persisted in the same transaction as the buffered events. On restart the alarm finds "session state but no socket" and RESUMEs, and Discord replays the missed events.
-  - If the session can't be resumed (op 9 with `d: false`, or close code 4007/4009), the bot re-IDENTIFYs. It then catches up each channel over REST with `GET /channels/{id}/messages?after=<last id>`, and writes a synthetic `GAP` record around the catch-up.
-- **No transport compression.** Bandwidth is free, and zlib-stream across Durable Object restarts only adds bugs.
-- **REST pacing**
-  - Honour the `X-RateLimit-*` headers and never retry-storm.
-  - Workers share egress IPs, and Discord bans per IP after 10k invalid requests (401, 403 or 429) in 10 minutes. Backfill is the risky path, so it runs slowly.
-- **Configuration** (see the README for the exact schema):
-  - Secrets: `DISCORD_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `ADMIN_KEY`.
-  - Variables: `GITHUB_APP_ID`, and `REJGAU_CONFIG`, a JSON object mapping each guild to its repo, branch, folder, channel selection and backfill flag.
-  - Variables are managed in the Cloudflare dashboard (`keep_vars`). Changing them redeploys, which restarts the Durable Objects; the session just resumes.
-  - Admin slash commands are deferred: at this scale, editing one JSON variable is simpler than running an Interactions endpoint.
+The bot appends sanitized payloads instead of copying every Discord field. It removes moderation state, permission lists, safety-scanner data, and app-internal identifiers.
+Guild snapshots omit unselected channel inventories and unrelated membership data. Private account flags differ from public display flags.
 
-### Discord
+The sanitizer uses event and field context for user and member objects. Partial members and members with null join dates receive the same privacy treatment.
+It also removes thread-member notification flags. Message, channel, attachment, and embed flags retain their display meaning.
 
-- **Install** with `scope=bot`, `integration_type=0`, `permissions=66560` (View Channel + Read Message History). Add Connect (1115136 total) if voice-channel text history backfill is wanted. The bot sends nothing, so it needs no send permissions.
-- **Intents:** `GUILDS`, `GUILD_EXPRESSIONS`, `GUILD_MESSAGES`, `GUILD_MESSAGE_REACTIONS`, `MESSAGE_CONTENT` (privileged; a portal toggle below 10k users), `GUILD_MESSAGE_POLLS`. `GUILD_SCHEDULED_EVENTS` is optional.
-- **Channel selection.** "Public" is a server convention, not a Discord permission bit. For example, the main server keeps most channels hidden from @everyone until members pass a bot check. So the bot archives **any** channel it can see and that the config selects, private or not:
-  1. Discord permissions decide what the bot *can* see. The admin grants the bot's role View Channel + Read Message History wherever archiving is wanted. From 2026-11-16, channels the bot can't view arrive obfuscated (`___hidden___`, flag 1<<17) and are ignored.
-  2. `REJGAU_CONFIG` decides what it *does* archive: `"channels": "all"`, or a list of channel and/or category IDs. A category includes all its current and future channels. An optional `exclude` list applies on top.
+The fold applies the current sanitizer when it reads older raw records. This protects newly generated views without rewriting historical raw files.
+Existing public Git history still contains its original records. Removing data from that history remains a separate operator action.
 
-  Threads (public, private the bot can see, and forum posts) are included when their parent channel is.
-- **Captured events**
-  - Messages: create, update, delete, delete-bulk.
-  - Reactions: add, remove, remove-all, remove-emoji.
-  - Polls: votes, add and remove.
-  - Pins: `CHANNEL_PINS_UPDATE`, plus the type-6 system message.
-  - Threads: create, update, delete, list-sync.
-  - Channels: update of enabled channels (name, topic).
-  - Guild: updates to guild, roles, emoji and stickers (needed for rendering).
-  - Text chat in voice and stage channels, and forwards (`message_snapshots`).
-- **Other apps' commands**
-  - What's visible: the public response message (type 20/23) with `interaction_metadata` (invoking user, target, follow-up linkage), and the command name. The spike confirmed the name is present both in the deprecated `interaction.name` and, undocumented, in `interaction_metadata.name` (with `command_type`), including the subcommand path (e.g. `jbotci gentufa`).
-  - Deferred responses appear as a LOADING message followed by `MESSAGE_UPDATE`.
-  - Not visible: the invocation itself, command arguments, ephemeral responses, and button/select/modal submissions (only their visible effects).
-  - Components V2 layouts arrive as the full component tree.
+## Git commits and bounded work
 
-## Archive layout
+The committer reads the current branch tip before it appends data. It creates a new tree and commit, then updates the branch without force.
+A conflicting branch update causes another attempt against the newer tip. The writer never assumes that its previous commit remains an ancestor.
 
-Everything below lives under a configurable folder on the `archive` branch. All times and days are UTC.
+Pending rows enter a batch through an iterator. The batch contains at most 4 MiB of encoded lines and 40 paths.
+The complete commit has an 8 MiB budget, with 4 KiB reserved for metadata.
+Existing file content counts toward that budget.
 
-```
-<folder>/
-  archive.json                  { format: 2, guild_id, generator }   (format 1 had one raw/YYYY/MM/DD.jsonl per day)
-  raw/YYYY/MM/DD/<channel>.jsonl RAW: every archived event, verbatim, plus rejgau records (the bot only appends here);
-                                one file per channel or thread and day, guild.jsonl for server-wide records
-  -- phase 2 (reader), generated from raw/ by a GitHub Action:
-  guild.json                    latest guild snapshot (from GUILD_SNAPSHOT / GUILD_UPDATE / role & emoji events)
-  channels.json                 id → latest object of every archived channel & thread and their ancestors
-  media.json                    media index (from MEDIA_STORED / MEDIA_FAILED records)
-  users.json                    id → latest user/member info seen (username, global_name, avatar, nick, bot)
-  view/<channel_id>/YYYY-MM.json DERIVED: reader data for messages created that month in that channel
-  manifest.json                 reader entry point: channels, months available, counts, sizes
-```
+An oversized pending line or remote file stays queued. The committer records its path, reason, and next retry time in `blocked_paths`.
+Other paths can continue. A blocked path waits 15 minutes before another automatic attempt.
 
-### Raw log (source of truth)
+The limits bound payload bytes, not total JavaScript heap use. Parsed strings, maps, and request objects also consume memory.
+A large historical day file therefore requires operator attention instead of unlimited allocation. The raw file format does not change automatically.
 
-- There is one line per event, in receive order:
-  ```json
-  {"at":"2026-09-29T10:41:07.123Z","src":"gw","s":1234,"t":"MESSAGE_CREATE","d":{…verbatim…}}
-  ```
-- `src` is one of:
-  - `gw`: live Gateway dispatch.
-  - `rest`: backfill or catch-up. `t` is `MESSAGE_CREATE` and `d` is the REST message object. These lines go into the file for the day the message was *created*, not the day it was fetched, so backfilled history lands where a reader expects it.
-  - `rejgau`: synthetic records:
-    - `GUILD_SNAPSHOT`: written instead of the raw `GUILD_CREATE`, and with no `channels`, `threads`, `members`, `presences` or `voice_states`. The raw `GUILD_CREATE` lists every channel the bot can see, which would leak the names of channels that aren't archived.
-    - `CHANNEL_SNAPSHOT`: the channel or thread object when it first becomes archived.
-    - `CATCHUP_BEGIN` / `CATCHUP_END`: bracket REST catch-up after a lost session.
-- Only events concerning archived channels (and guild-level events needed for rendering) are written. Events for other channels, including `CHANNEL_*`/`THREAD_*` for them, are dropped.
-- Delivery is at-least-once: after a crash, events may be replayed and REST catch-up may repeat live messages. Consumers dedupe by message ID and event content.
-- Live events only append to the current day's file. Backfill appends to past days' files.
-- At ~100 messages a day, a day file is ~200–400 KB, and ~100 MB a year uncompressed. Git's delta compression makes the repository much smaller than that.
+Only rows included in a successful commit leave the queue. A failed GitHub request preserves those rows and records a retry deadline.
+Default scheduling commits after two idle minutes or ten minutes from the first pending event. Configuration can change both intervals.
 
-### Privacy filtering
+## Media jobs and releases
 
-All logged payloads pass through `src/sanitize.ts`. It keeps what channel members can see in the client and drops moderation state, security configuration, safety-scanner output, app-internal IDs and bot-perspective fields. The README lists each field and why. "Verbatim" in this document means verbatim minus those fields.
+Media upload is separate from raw-event delivery. The alarm processes due commits before optional external work and reconsiders commits before media work.
+One media job runs at a time for a guild. A stalled source therefore has a deadline and cannot hold raw delivery indefinitely.
 
-### Derived view (regenerable)
+Media keys come from attachment IDs, avatar hashes, emoji IDs, or a stable URL hash. `src/media.ts` defines the same keys for collection and rendering.
+Successful and failed uploads become raw `MEDIA_STORED` and `MEDIA_FAILED` records. The latest record for a key determines its generated media entry.
 
-- A late edit, reaction or delete to an old message changes that message's *month* file. The reader therefore never has to replay events.
-- **Format:** per channel per month, a compact JSON built for the reader:
-  - users referenced by ID rather than embedded;
-  - Discord fields normalized;
-  - edit history kept (`edits: [{at, content, …}]`);
-  - deletes kept as `deleted_at` (content retained, since redaction is manual);
-  - reactions aggregated.
-- **Size:** roughly 300–500 bytes per message, so a whole year of the main server is ~15–20 MB. The reader can load all of it for search.
-- The generator is a pure function from raw logs to view files. A `rebuild` command regenerates everything from `raw/`, for example after a format change or manual surgery.
+A trustworthy content length permits streaming. Unknown or encoded lengths require a bounded buffer.
+The configured media limit applies in both cases. The unknown-length buffer also has a 32 MiB cap.
 
-## Media
+An expired attachment URL triggers a fresh message lookup. A transient lookup failure remains retryable instead of becoming a permanent missing file.
+A confirmed inaccessible or missing message ends that attempt as a media failure. Failed media can return to the queue through the operator route.
 
-- **Store:** GitHub Release assets in the archive repo.
-  - Official API; each file must be under 2 GiB; up to 1000 assets per release; no limit on total size or bandwidth.
-  - They are not part of the git tree, and live as long as the repo does.
-  - Download URLs redirect to signed blob URLs that `<img>`/`<video>`/`<audio>` load directly and that support byte ranges. There's no CORS, so other file types are download links in the reader.
-- **Releases:** one per month, `media-YYYY-MM`, rolling over to `media-YYYY-MM.2` at 1000 assets. Expected volume is ≤10 images a day, ~300 a month.
-  - Their tags point at a dedicated parentless **media-root commit**, never into `archive` history. A history rewrite then never has tags pinning old log content.
-- **What's archived:** attachments (including Components V2 media), embed images and thumbnails (from the original URL), sticker images, custom emoji (in content and reactions), user and member avatars, and the guild icon.
-- **Asset names** come from Discord identity, not a content hash. This lets the Worker stream downloads straight into the upload without buffering, within its 128 MB memory limit:
-  - `att-<attachment_id>-<filename>`
-  - `emoji-<id>.<png|gif>`
-  - `sticker-<id>.<png|json>`
-  - `avatar-<user_id>-<hash>.<png|gif>`
-  - `embed-<sha256(url)[:16]>.<ext>`
-  - `guild-<id>-<hash>.png`
+Release caches include the configured repository identity. The uploader reads the current release inventory before choosing an asset or upload target.
+An existing complete asset is reused. An incomplete upload can be removed before retry.
 
-  Avatars and emoji dedupe naturally, since Discord's hash changes when the image changes.
-- **Keys** as implemented: `att-<attachment_id>-<filename>`, `ext-<fnv64(url)>.<ext>` (embed images and external media), `emoji-<id>.<png|gif>`, `sticker-<id>.<png|json|gif>`, `avatar-<user>-<hash>.<png|gif>`, `gavatar-<guild>-<user>-<hash>.<ext>` and `guild-<id>-<hash>.<ext>`. The reader computes the key for any Discord media reference the same way (`src/media.ts`).
-- **Index:** each upload is recorded in raw as `MEDIA_STORED {key, release, name, url, size, content_type}` or `MEDIA_FAILED {key, reason}`. Phase 2 folds these into `media.json`.
-- **Size cap:** files above `maxMediaBytes` (default 100 MB) are recorded as `{ error: "too_large" }`.
-- **Fetcher**
-  - Attachment URLs are signed and expire (the lifetime is undocumented; historically 24 h), so media is fetched at ingest.
-  - The spike showed that Workers **can** fetch from `cdn.discordapp.com`: real signed attachments, avatars, custom emoji, and PNG/APNG/Lottie stickers (`cdn.discordapp.com/stickers/{id}.png|json`). Discord's docs claiming a 403 are outdated.
-  - Discord's proxy hosts are blocked (Cloudflare 403): `media.discordapp.net` and `images-ext-*.discordapp.net`. We avoid them:
-    - attachments: use `url` rather than `proxy_url`;
-    - embed images and thumbnails: fetch the embed's original `url` (e.g. `i.ytimg.com`, `repository-images.githubusercontent.com`) directly;
-    - GIF stickers (`format_type` 4) exist only on `media.discordapp.net`. They are recorded as "unfetched", with a GitHub Action fallback later if they turn out to matter.
-  - So the `GuildArchive` Durable Object downloads each file and uploads it to the release itself (`uploads.github.com`). No Action is needed.
-  - Only the bot writes the `archive` branch.
+Release names follow `media-YYYY-MM`, then numbered continuations. Their tags point at a parentless media-root commit.
+These tags therefore do not retain old archive history after a branch rewrite. The default upload spacing is eight seconds.
 
-## Writing to GitHub
+## Publication and operator boundaries
 
-- **Auth:** a GitHub App installed only on the archive repo, with `contents: write` (commits, releases and dispatch) and `metadata: read`.
-  - The Worker signs an RS256 JWT with WebCrypto and exchanges it for a 1-hour installation token.
-  - Commits are authored by `rejgau[bot]` and show as Verified, provided no custom author or committer is set.
-- **Commit flow (Git Data API)**
-  1. `GET ref`.
-  2. For each changed file, the new content goes inline in a `POST trees` call with `base_tree`. Text is UTF-8, so no separate blob calls are needed.
-  3. `POST commits`.
-  4. `PATCH ref`, without `force`.
+The raw archive is the source for both generated outputs. Publication never depends on a range of recent commits.
+The fold supplies one deletion resolver to the site and Markdown logs. Both outputs apply current selection and deletion rules.
 
-  That is 4 calls per flush, far below GitHub's secondary limits (80 content-creating requests per minute, 500 per hour).
-- **Cadence:** flush when there are pending events *and* either 2 minutes have been idle or 10 minutes have passed since the first pending event. Both values are configurable. At current volume that's a few dozen commits a day.
+A deletion tombstone records a deleted message ID independently of message content. It suppresses delayed snapshots and deleted originals embedded in replies.
+Forwarded snapshots retain their intentional copied content. Publication does not erase a forward solely because its original message later disappears.
 
-### History rewrites by the admin
+The shared publication contract describes generated JSON and makes sure that consumed fields have supported shapes at runtime.
+The reader and generator import the same types. The raw Discord boundary remains separate because its payload fields can evolve.
 
-The admin may rewrite `archive` history at any time, for example to remove messages on request. The writer and all readers must tolerate that:
+The builder stages a complete output before promotion. It tracks owned files, removes obsolete generated paths, and refuses unowned-file collisions.
+The [reader design](reader.md) describes generation directories, recovery journals, and filesystem limits.
 
-- **Never assume the previous commit is an ancestor.** Each flush reads the current head and builds on it. If the ref update fails because the head moved, it re-reads and retries. It does not force.
-- **Pause for surgery.** `POST /pause` stops commits (events keep buffering); the procedure is pause → flush → rewrite → force-push → resume.
-- **Never append from a cache.** Before appending to a day file, read the *current tip version* and append to that. This way a manual redaction is never resurrected by the bot's in-memory copy. Comparing blob SHAs with what the bot last wrote makes this cheap in the common case.
-- **Readers (Actions, Pages, the reader) process the files at the tip, never commit ranges or diffs.** Work must be idempotent: "which media sources lack an index entry", not "what changed since commit X".
-- Release tags live on the media-root commit, so a rewrite never needs to touch them.
-- **Deletion procedure** (documented in the archive repo's README, possibly with a helper script later):
-  1. Remove or replace the lines in `raw/` and the entries in `view/`, or run `rebuild`.
-  2. Remove the `media.json` entries and delete the release assets.
-  3. Rewrite history (e.g. `git filter-repo`) and force-push.
-  4. Optionally ask GitHub Support to purge cached views and unreachable objects.
+Publishing a source commit does not prove that a Worker or reader uses it. Worker deployments and the archive repository renderer pin are separate choices.
+Generated provenance records the available source revisions and raw digest. The Pages workflow publishes that completed artifact.
 
-  Forks and Software Heritage snapshots are outside our control.
-
-## Reader
-
-- **Hosting:** static HTML/JS, built in this repo and published as an Action or release artifact. The archive repo's Pages workflow deploys the reader together with the archive data. Everything is then same-origin, and Pages is well within its 1 GB site limit.
-  - The reader also works from anywhere else via `?archive=<base URL>`. GitHub Pages sends `Access-Control-Allow-Origin: *`.
-  - Avoid `raw.githubusercontent.com`: it has had undocumented per-IP limits since 2025-05.
-- **Data loading:** load `manifest.json` → `guild.json`/`channels.json`/`users.json`/`media.json` → `view/<channel>/<month>.json` on demand.
-- **Rendering:** read-only, close to Discord.
-  - Markdown with Discord's quirks, parsed with a simple-markdown-based rule set: `discord-markdown-parser` is a candidate base. Supported syntax:
-    - line-start-only headers, lists, `-#` subtext and quotes, including `>>>`;
-    - spoilers, masked links, code blocks with highlighting;
-    - mentions, custom emoji (jumbo when the message is emoji-only), and `<t:…:style>` timestamps in the viewer's locale;
-    - command mentions and guild navigation links.
-  - Message parts:
-    - replies, forwards, embeds, attachments, stickers, reactions, polls (results) and threads;
-    - system messages;
-    - the "X used /cmd" header on command responses;
-    - Components V1 (disabled) and V2 (container, section, text display, thumbnail, media gallery, file, separator, action rows).
-  - Beyond Discord: an edit-history viewer, and "deleted" badges.
-- **Search**
-  - Filters parsed from Discord syntax:
-    - `from:`, `mentions:`, `in:`;
-    - `has:` (link, embed, file, image, video, sound, sticker, poll, forward);
-    - `before:`, `after:`, `during:`;
-    - `pinned:`, `authorType:` (user, bot, webhook);
-    - `-` negation and `"exact phrase"`.
-  - Anything else is plain text: case-insensitive and diacritic-insensitive.
-  - `from:` and `mentions:` resolve names through `users.json`. `in:` resolves through `channels.json`.
-  - v1 scans view files in a Web Worker, newest first, with date and channel filters pruning which files are fetched. At the expected volume the whole archive fits comfortably. A prebuilt index (MiniSearch shards, Pagefind or SQLite FTS built in CI) can come later if needed.
-
-## Spike results (2026-09-29)
-
-The spike lived in `spike/` (removed after it served its purpose; see commit `b069b37`). It was deployed to Workers Paid as `rejgau-spike` and connected to the test server.
-
-- **Gateway from a Durable Object works.** HELLO arrives about 50 ms after the upgrade, and IDENTIFY/READY and heartbeats work.
-- **Restarts and resume.** Over the first ~3.5 h the Durable Object restarted 4 times, with no deploys. Each time the alarm reconnected and RESUMEd successfully, with 0 re-identifies and 0 zombie connections. Restarts are routine, so resume must be solid, and the gap-detection path is still required for when resume fails.
-- **CDN** results are as described under Media.
-- **Observed payloads**
-  - Deferred command responses: `MESSAGE_CREATE` with flags `LOADING` (128), then `MESSAGE_UPDATE` with the real content (here `IS_COMPONENTS_V2`, 32768).
-  - When an app edits its own response (e.g. jbotci re-rendering after a button click, which is app-specific behavior), we see `MESSAGE_UPDATE` with `edited_timestamp`, and the original command's `interaction_metadata` is kept. The click itself is invisible.
-  - Components V2 arrive as the full tree, including media gallery items that point at `cdn.discordapp.com` attachments.
-  - Link embeds arrive as a follow-up `MESSAGE_UPDATE` with no `edited_timestamp` (unfurl).
-  - Forwards (`flags` 16384) carry full `message_snapshots` content, including forwards from other channels.
-  - Polls, poll votes, reactions, edits and deletes all arrive as expected.
-  - User objects carry many cosmetic fields (`collectibles`, `primary_guild`, `avatar_decoration_data`, …). They are kept verbatim in raw, and the reader ignores what it doesn't render.
-- **User-installed apps work.** A command from an app installed only for the user (not in the server) produced a normal `MESSAGE_CREATE` (LOADING) and `MESSAGE_UPDATE`. They carry `interaction_metadata.name` and `authorizing_integration_owners: {"1": <user id>}`, with no `"0"` (guild) key, which distinguishes them from guild-installed apps.
-
-## Implementation phases
-
-1. **Bot (this phase).** Gateway session, routing, raw logs, snapshots, media, catch-up and backfill, commits.
-   - Backfill pages forward from the start of each selected channel and its active threads, paced.
-   - Archived threads are not backfilled yet.
-2. **Reader.** Derived `view/`, `users.json` and `manifest.json` (generated by a GitHub Action from `raw/`, so the bot stays simple), the static reader, and a Pages workflow.
-   - Pages and release-asset images require a **public** repo (or a paid plan for Pages on private repos; private release assets need auth to view).
-
-Later:
-- Archived-thread backfill.
-- Admin slash commands.
-- The helper for manual deletion surgery.
+Tests use synthetic Discord, Gateway, and GitHub services. They cover persisted retries, lifecycle races, stalled responses, bounded batches, visibility changes, and publication privacy.
+Browser tests cover asynchronous navigation, search failures, mobile navigation, generation replacement, and resource limits.
+These tests do not prove that Discord delivered every event during an outage.
