@@ -1,5 +1,7 @@
 // This contract describes generated files. Raw Discord records keep their source format.
 
+export const MAX_PUBLICATION_FILE_BYTES = 32 * 1024 * 1024;
+
 export interface UserSnap {
   id: string;
   username?: string;

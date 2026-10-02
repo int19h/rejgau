@@ -58,6 +58,8 @@ export interface MediaEntry {
   error?: string;
 }
 
+export interface ReactorProfile { user: any; member: any; at: string }
+
 export interface ArchiveState {
   guild: any;
   channels: Map<string, ChannelState>;
@@ -67,7 +69,7 @@ export interface ArchiveState {
   /** user id → latest member snapshot from MEMBER_SNAPSHOT (null = left the server). */
   memberSnapshots: Map<string, any | null>;
   /** Message ID, then user ID, keeps profile sources within their published message. */
-  reactors: Map<string, Map<string, { user: any; member: any; at: string }>>;
+  reactors: Map<string, Map<string, ReactorProfile>>;
   media: Map<string, MediaEntry>;
 }
 
@@ -111,6 +113,20 @@ export function isPublished(state: ArchiveState, id: string): boolean {
   const ch = state.channels.get(id);
   if (!ch?.selected) return false;
   return !THREAD_TYPES.has(ch.c.type) || !!state.channels.get(ch.c.parent_id)?.selected;
+}
+
+/** Profiles required by current reactions and votes on one published message. */
+export function* publishedReactorUsers(state: ArchiveState, ms: MessageState): Generator<[string, ReactorProfile]> {
+  if (ms.deletedAt || state.deletedMessages.has(ms.m.id) || !isPublished(state, ms.channelId)) return;
+  const ids = new Set([
+    ...[...ms.reactions.values()].flatMap((reaction) => [...reaction.known]),
+    ...[...ms.votes.values()].flatMap((vote) => [...vote.known]),
+  ]);
+  const profiles = state.reactors.get(ms.m.id);
+  for (const id of ids) {
+    const profile = profiles?.get(id);
+    if (profile) yield [id, profile];
+  }
 }
 
 /**

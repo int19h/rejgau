@@ -1,7 +1,7 @@
 // Turns folded archive state into the reader's data files. Pure: returns path → JSON value.
 
 import { avatarRef, emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "../src/media";
-import { isPublished, previewText, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, previewText, publishedReactorUsers, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { normalizeText } from "../reader/src/text";
 
 import { parseArchive, parseMonthFile, parseSearchRows, parseUsersFile, type Archive, type ChannelInfo, type MonthFile, type PublicationFile, type PublishedMessage, type SearchRow, type UserSnap, type UsersFile } from "../shared/publication";
@@ -251,13 +251,8 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
       for (const k of msg.mentions ?? []) noteUser(snaps.users[k], msg.ts);
       if (msg.referenced && !msg.referenced.deleted && msg.referenced.author) noteUser(snaps.users[msg.referenced.author], msg.ts);
       if (msg.interaction?.user) noteUser(snaps.users[msg.interaction.user], msg.ts);
-      const required = new Set([
-        ...(msg.reactions ?? []).flatMap((r) => r.users ?? []),
-        ...Object.values(msg.votes ?? {}).flatMap((v) => v.users ?? []),
-      ]);
-      for (const id of required) {
-        const profile = state.reactors.get(msg.id)?.get(id);
-        if (profile) noteUser(snapUser(profile.user, profile.member) ?? undefined, profile.at);
+      for (const [, profile] of publishedReactorUsers(state, list[i])) {
+        noteUser(snapUser(profile.user, profile.member) ?? undefined, profile.at);
       }
       if (!search.has(month)) search.set(month, []);
       search.get(month)!.push(searchRow(msg, channelId, snaps, list[i].m));
