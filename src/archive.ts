@@ -63,7 +63,7 @@ export interface IngestResult {
 /** Whether retrying could help: Discord/GitHub 5xx or 429, or a network-level failure. */
 function isTransient(e: unknown): boolean {
   if (e instanceof DiscordError || e instanceof GitHubError) return e.status >= 500 || e.status === 429 || (e instanceof GitHubError && e.retryAfterMs !== null);
-  return true; // network errors and anything unexpected: retry (the pump caps it)
+  return true; // Retry network and unexpected errors indefinitely; the pump caps the delay.
 }
 
 type ChannelRow = {
