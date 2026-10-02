@@ -65,7 +65,10 @@ export class GatewayOutbox {
   }
 
   batch(guild: string): DeliveryRow[] {
-    return this.sql.exec<DeliveryRow>(`SELECT * FROM outbox WHERE guild = ? ORDER BY n LIMIT ?`, guild, BATCH).toArray();
+    const rows = this.sql.exec<DeliveryRow>(`SELECT * FROM outbox WHERE guild = ? ORDER BY n LIMIT ?`, guild, BATCH).toArray();
+    // The archive keeps one session watermark. A lost reply must remain safe to retry.
+    const boundary = rows.findIndex((row) => row.sid !== rows[0].sid);
+    return boundary < 0 ? rows : rows.slice(0, boundary);
   }
 
   accept(guild: string, rows: DeliveryRow[], handled: number): void {

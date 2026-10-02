@@ -4,6 +4,7 @@ import { afterAll, expect, it } from "vitest";
 import worker from "../../src/index";
 import { GatewayOutbox } from "../../src/gateway-outbox";
 import { DiscordCooldowns } from "../../src/discord-limits";
+import type { OutboxEvent } from "../../src/env";
 
 async function settled(o: any): Promise<void> {
   for (let i = 0; i < 200; i++) {
@@ -65,6 +66,45 @@ it("defers rate limits without increasing the delivery failure count", async () 
     await settled(o);
     expect(state.storage.sql.exec(`SELECT attempts, next_at FROM delivery_retry`).one()).toEqual({ attempts: 0, next_at: retryAt });
   });
+});
+
+it("retries lost replies without replaying events across session boundaries", async () => {
+  const archive = env.GUILD.get(env.GUILD.idFromName("lost-reply-archive"));
+  await runInDurableObject(archive, (object) => {
+    const o = object as any;
+    for (const [key, value] of Object.entries({ paused: "1", initialized: "1", botUserId: "999", permRoles: '{"107":"1024"}', botRoles: "[]", permAt: String(Date.now()) })) o.set(key, value);
+  });
+  const gateway = env.GATEWAY.get(env.GATEWAY.idFromName("lost-reply-delivery"));
+  const batches: string[][] = [];
+  const lost = new Set<string>();
+  await runInDurableObject(gateway, async (object, state) => {
+    const o = object as any;
+    const receiver = o.env.GUILD.get(o.env.GUILD.idFromName("lost-reply-archive"));
+    o.env = { ...o.env, GUILD: { idFromName: (id: string) => id, get: () => ({ ingest: async (guild: string, events: OutboxEvent[]) => {
+      batches.push(events.map((event) => event.sid));
+      const result = await receiver.ingest(guild, events);
+      if (!lost.has(events[0].sid)) {
+        lost.add(events[0].sid);
+        throw new Error("The reply was lost after the archive saved its events.");
+      }
+      return result;
+    } }) } };
+    const outbox = new GatewayOutbox(state.storage);
+    for (const [sid, s] of [["old", 1], ["old", 2], ["new", 1]] as const) {
+      outbox.enqueue("107", { sid, s, t: "GUILD_UPDATE", d: JSON.stringify({ id: "107", name: `${sid}-${s}` }), at: Date.now() });
+    }
+    for (let attempt = 0; attempt < 4 && outbox.counts().outbox; attempt++) {
+      state.storage.sql.exec(`UPDATE delivery_retry SET next_at = 0`);
+      o.kickPump();
+      await settled(o);
+    }
+    expect(outbox.counts().outbox).toBe(0);
+  });
+  await runInDurableObject(archive, (_object, state) => {
+    const saved = state.storage.sql.exec<{ line: string }>(`SELECT line FROM pending ORDER BY n`).toArray().map((row) => JSON.parse(row.line));
+    expect(saved.filter((event) => event.t === "GUILD_UPDATE").map((event) => event.d.name)).toEqual(["old-1", "old-2", "new-1"]);
+  });
+  expect(batches).toEqual([["old", "old"], ["old", "old"], ["new"], ["new"]]);
 });
 
 it("quarantines one guild and restores its original order through exact retry", async () => {

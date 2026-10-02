@@ -46,9 +46,14 @@ export async function discordGet<T>(env: DiscordEnv, path: string): Promise<T> {
       resetAt: resetAfter ?? resetAt,
     };
     if (res.status === 429) {
-      const body = await res.json().catch(() => ({})) as { retry_after?: unknown; global?: unknown };
-      observation.global = body.global === true || res.headers.get("x-ratelimit-global") === "true" || res.headers.get("x-ratelimit-scope") === "global";
-      observation.retryAt = Math.max(deadline(body.retry_after, now) ?? 0, deadline(res.headers.get("retry-after"), now) ?? 0, observation.resetAt ?? 0, now + 1000);
+      observation.global = res.headers.get("x-ratelimit-global") === "true" || res.headers.get("x-ratelimit-scope") === "global";
+      observation.retryAt = Math.max(deadline(res.headers.get("retry-after"), now) ?? 0, observation.resetAt ?? 0, now + 1000);
+      // Keep header limits even if the response body is malformed or stalls.
+      await coordinator.observeDiscordLimit({ ...observation });
+      const parsed: unknown = await res.json().catch(() => null);
+      const body = parsed !== null && typeof parsed === "object" ? parsed as { retry_after?: unknown; global?: unknown } : {};
+      observation.global ||= body.global === true;
+      observation.retryAt = Math.max(deadline(body.retry_after, now) ?? 0, observation.retryAt);
       const retryAt = await coordinator.observeDiscordLimit(observation);
       throw new DiscordRateLimitError(path, retryAt);
     }

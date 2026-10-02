@@ -30,7 +30,7 @@ it("persists the full 429 deadline and refuses another request before it", async
   expect(error).toBeInstanceOf(DiscordRateLimitError);
   if (!(error instanceof DiscordRateLimitError)) throw new Error("Expected a Discord rate limit.");
   expect(error.retryAt).toBe(now + 120_100);
-  expect(observations[0]).toMatchObject({ global: true, retryAt: now + 120_100 });
+  expect(observations.at(-1)).toMatchObject({ global: true, retryAt: now + 120_100 });
   await expect(discordGet(env, "/guilds/107/roles")).rejects.toBeInstanceOf(DiscordRateLimitError);
   expect(fetch).toHaveBeenCalledTimes(1);
 });
@@ -53,6 +53,31 @@ it("uses the longer retry header and rejects nonfinite server delays", async () 
   const error = await discordGet(env, "/channels/11/messages").catch((e) => e);
   if (!(error instanceof DiscordRateLimitError)) throw new Error("Expected a Discord rate limit.");
   expect(error.retryAt).toBe(now + 90_100);
+});
+
+it.each(["null", "[]", "false", "invalid JSON"])("preserves rate-limit headers when the body is %s", async (body) => {
+  vi.useFakeTimers();
+  const now = Date.now();
+  const { env, observations } = environment();
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 429, headers: { "retry-after": "120", "x-ratelimit-global": "true" } })));
+  const error = await discordGet(env, "/users/@me").catch((e) => e);
+  expect(error).toBeInstanceOf(DiscordRateLimitError);
+  expect(error.retryAt).toBe(now + 120_100);
+  expect(observations[0]).toMatchObject({ global: true, retryAt: now + 120_100 });
+});
+
+it("persists rate-limit headers before waiting for a stalled response body", async () => {
+  vi.useFakeTimers();
+  const now = Date.now();
+  const { env, observations } = environment();
+  const fetch = vi.fn(async () => new Response(new ReadableStream(), { status: 429, headers: { "retry-after": "120", "x-ratelimit-global": "true" } }));
+  vi.stubGlobal("fetch", fetch);
+  const request = discordGet(env, "/users/@me").catch((error) => error);
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect((await request).name).toBe("RequestTimeoutError");
+  expect(observations[0]).toMatchObject({ global: true, retryAt: now + 120_100 });
+  await expect(discordGet(env, "/guilds/107/roles")).rejects.toBeInstanceOf(DiscordRateLimitError);
+  expect(fetch).toHaveBeenCalledTimes(1);
 });
 
 it("groups minor IDs while keeping the channel or guild identity", () => {
