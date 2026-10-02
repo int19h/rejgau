@@ -50,4 +50,3 @@ export function Sidebar({ archive, current, open, onSelect }: { archive: Archive
     </nav>
   );
 }
-
