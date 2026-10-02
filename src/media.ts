@@ -42,7 +42,10 @@ export function refForUrl(raw: string, ctx: { channelId?: string; messageId?: st
   if (att && (u.hostname === "cdn.discordapp.com" || u.hostname === "media.discordapp.net")) {
     // media.discordapp.net is blocked for Workers; the same object is on the CDN.
     const url = `${CDN}${u.pathname}${u.search}`;
-    return { key: `att-${att[2]}-${sanitizeName(decodeURIComponent(att[3]))}`, url, ...ctx };
+    let filename = att[3];
+    try { filename = decodeURIComponent(filename); }
+    catch { /* Keep malformed escapes encoded so one URL cannot stop an event. */ }
+    return { key: `att-${att[2]}-${sanitizeName(filename)}`, url, ...ctx };
   }
   if (/^images-ext-\d+\.discordapp\.net$/.test(u.hostname)) {
     // Discord's external-image proxy (blocked for Workers). Its path embeds the original URL.

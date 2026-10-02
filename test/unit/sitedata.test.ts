@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { fold, type RawLine } from "../../tools/fold";
 import { buildSiteData } from "../../tools/sitedata";
+import { buildLogs } from "../../tools/logs";
 
 const line = (t: string, d: any, i: number, src: RawLine["src"] = "gw"): RawLine => ({ at: new Date(Date.UTC(2026, 8, 1) + i * 1000).toISOString(), src, t, d });
 const M = (id: string, channel: string, extra: any = {}) => ({ id, channel_id: channel, content: `msg ${id}`, author: { id: "7", username: "u", avatar: "abc" }, ...extra });
@@ -60,5 +61,63 @@ describe("deleted and edited messages", () => {
     const all = JSON.stringify([...files.values()]);
     expect(all).not.toContain("regret this");
     expect(all).not.toContain("edited later");
+  });
+});
+
+describe("publication privacy regressions", () => {
+  it.each(["MESSAGE_DELETE", "MESSAGE_DELETE_BULK"])("suppresses an original known only through a reply after %s", (event) => {
+    const deletion = event === "MESSAGE_DELETE" ? { id: ID1 } : { ids: [ID1] };
+    const st = fold([
+      line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+      line("MESSAGE_CREATE", M(ID2, "11", { type: 19, content: "visible reply", referenced_message: M(ID1, "11", { content: "private original", author: { id: "8", username: "deleted author" } }), message_reference: { message_id: ID1 } }), 1),
+      line(event, { ...deletion, channel_id: "11" }, 2),
+      line("MESSAGE_CREATE", M(ID1, "11", { content: "private original" }), 3, "rest"),
+    ]);
+    const { files } = buildSiteData(st);
+    const month: any = files.get("c/11/2026-09.json");
+    expect(month.messages).toHaveLength(1);
+    expect(month.messages[0].referenced).toEqual({ deleted: true });
+    expect(JSON.stringify([...files.values()])).not.toMatch(/private original|deleted author/);
+    expect([...buildLogs(st).values()].join("\n")).not.toMatch(/private original|deleted author/);
+  });
+
+  it("preserves an intentional forwarded snapshot when its source message is deleted", () => {
+    const { files } = buildSiteData(fold([
+      line("CHANNEL_SELECTED", { channel: { id: "11", type: 0 } }, 0, "rejgau"),
+      line("MESSAGE_DELETE", { id: ID1, channel_id: "11" }, 1),
+      line("MESSAGE_CREATE", M(ID2, "11", { message_reference: { type: 1, message_id: ID1 }, message_snapshots: [{ message: { content: "intentional forward" } }] }), 2),
+    ]));
+    const month: any = files.get("c/11/2026-09.json");
+    expect(month.messages[0].message_snapshots[0].message.content).toBe("intentional forward");
+  });
+
+  it.each(["unselected", "deleted", "removed"])("omits reactor profiles and media after the only usage is %s", (action) => {
+    const lines = [
+      line("CHANNEL_SELECTED", { channel: { id: "11", type: 0 } }, 0, "rejgau"),
+      line("MESSAGE_CREATE", M(ID1, "11"), 1),
+      line("MESSAGE_REACTION_ADD", { message_id: ID1, user_id: "99", emoji: { name: "a" }, member: { nick: "Hidden nickname", roles: ["3"], user: { id: "99", username: "OnlyHidden", avatar: "hidden" } } }, 2),
+    ];
+    if (action === "unselected") lines.push(line("CHANNEL_UNSELECTED", { id: "11" }, 3, "rejgau"));
+    if (action === "deleted") lines.push(line("MESSAGE_DELETE", { id: ID1 }, 3));
+    if (action === "removed") lines.push(line("MESSAGE_REACTION_REMOVE", { message_id: ID1, user_id: "99", emoji: { name: "a" } }, 3));
+    const output = JSON.stringify([...buildSiteData(fold(lines)).files.values()]);
+    expect(output).not.toMatch(/OnlyHidden|Hidden nickname|avatar-99-hidden/);
+  });
+
+  it("keeps visible reactor and voter profiles without importing a hidden message's newer profile", () => {
+    const { files } = buildSiteData(fold([
+      line("CHANNEL_SELECTED", { channel: { id: "11", type: 0 } }, 0, "rejgau"),
+      line("CHANNEL_SELECTED", { channel: { id: "12", type: 0 } }, 1, "rejgau"),
+      line("MESSAGE_CREATE", M(ID1, "11"), 2),
+      line("MESSAGE_CREATE", M(ID2, "12"), 3),
+      line("MESSAGE_REACTION_ADD", { message_id: ID1, user_id: "99", emoji: { name: "a" }, member: { user: { id: "99", username: "Visible name" } } }, 4),
+      line("MESSAGE_POLL_VOTE_ADD", { message_id: ID1, user_id: "99", answer_id: 1 }, 5),
+      line("MESSAGE_REACTION_REMOVE", { message_id: ID1, user_id: "99", emoji: { name: "a" } }, 6),
+      line("MESSAGE_REACTION_ADD", { message_id: ID2, user_id: "99", emoji: { name: "a" }, member: { user: { id: "99", username: "Hidden name" } } }, 7),
+      line("CHANNEL_UNSELECTED", { id: "12" }, 8, "rejgau"),
+    ]));
+    const users: any = files.get("users.json");
+    expect(users.users["99"].username).toBe("Visible name");
+    expect(JSON.stringify([...files.values()])).not.toContain("Hidden name");
   });
 });

@@ -48,29 +48,41 @@ function isExpression(o: Record<string, unknown>): boolean {
   return typeof o.id === "string" && typeof o.name === "string" && ("require_colons" in o || "format_type" in o || "managed" in o && "animated" in o);
 }
 
+type Context = "payload" | "user" | "member";
+
 function isMember(o: Record<string, unknown>): boolean {
-  return typeof o.joined_at === "string" && Array.isArray(o.roles);
+  return Array.isArray(o.roles) && ("joined_at" in o || "nick" in o || "user" in o)
+    || "join_timestamp" in o && ("user_id" in o || "id" in o);
 }
 
-/** Returns a copy of a Discord payload with non-public values removed. */
-export function sanitize<T>(value: T): T {
-  if (Array.isArray(value)) return value.map(sanitize) as T;
+function childContext(key: string): Context {
+  if (key === "member" || key === "members" || key === "added_members") return "member";
+  if (key === "user" || key === "author" || key === "mentions") return "user";
+  return "payload";
+}
+
+function sanitizeValue(value: unknown, context: Context): unknown {
+  if (Array.isArray(value)) return value.map((item) => sanitizeValue(item, context));
   if (typeof value !== "object" || value === null) return value;
   const o = value as Record<string, unknown>;
-  // `flags` on users includes private account flags (the public subset is `public_flags`); on
-  // members it carries moderation state (rejoined, bypassed verification, AutoMod quarantine).
-  // Message, channel, attachment and embed `flags` are presentational and kept.
-  const dropFlags = isUser(o) || isMember(o);
-  // Custom emoji and stickers name their uploader, which only server managers can see.
+  // Member flags describe moderation or the bot's thread notifications.
+  // User flags include private account state. Other payload flags remain public.
+  const dropFlags = context !== "payload" || isUser(o) || isMember(o);
   const dropUploader = isExpression(o);
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(o)) {
     if (DROP_ANYWHERE.has(k)) continue;
     if (k === "flags" && dropFlags) continue;
     if (k === "user" && dropUploader) continue;
-    out[k] = sanitize(v);
+    out[k] = sanitizeValue(v, childContext(k));
   }
-  return out as T;
+  return out;
+}
+
+/** Returns a copy with private fields removed. The event identifies standalone member payloads. */
+export function sanitize<T>(value: T, event?: string): T {
+  const context = event === "THREAD_MEMBER_UPDATE" || event?.startsWith("GUILD_MEMBER_") ? "member" : "payload";
+  return sanitizeValue(value, context) as T;
 }
 
 /** Guild member fields kept in MEMBER_SNAPSHOT records (what a profile shows other members). */

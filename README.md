@@ -106,9 +106,17 @@ Commits then appear as `<app-name>[bot]` and are marked Verified.
 This needs the Workers Paid plan: the Gateway connection keeps a Durable Object running around the clock.
 
 ```sh
-npm install
-npx wrangler deploy
+npm ci --ignore-scripts
+npm run typecheck
+npm test
+npm run deploy
 ```
+
+The deployment command requires a clean Git checkout. It records the full commit ID on the Worker version.
+
+If Cloudflare lists multiple accounts, set `CLOUDFLARE_ACCOUNT_ID` to the intended account before deployment.
+
+For a local bundle without deployment, run `npm run deploy -- --dry-run --outdir /tmp/rejgau-worker`.
 
 Then, in the Cloudflare dashboard, go to **Workers & Pages → rejgau → Settings → Variables and Secrets** and add:
 
@@ -162,32 +170,56 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" https://rejgau.<your-subdomai
 - **`maxMediaMegabytes`**: larger files are recorded as `MEDIA_FAILED` with `too_large`.
 - **`mediaUploadSpacingSeconds`**: the minimum gap between release uploads, which keeps them under GitHub's limits for content creation.
 
-Changing a variable redeploys the Worker. The Gateway session simply resumes, and selection changes are recorded in the log. Guilds the bot is in but that aren't configured are ignored.
+Configuration values require the documented types. Boolean fields accept only `true` or `false`. Time intervals accept finite values from 0 through 86,400 seconds. `maxMediaMegabytes` accepts finite values from 0 through 2,048. Invalid configuration stops collection until an administrator fixes it.
+
+Changing a variable redeploys the Worker. An enabled Gateway resumes its session, and the archive records selection changes. An explicit stop remains in effect. The bot ignores guilds outside the configuration.
 
 ## Admin endpoints
 
-Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized requests get a 404.
+Every endpoint requires `Authorization: Bearer <ADMIN_KEY>`. Unauthorized requests return HTTP 404. Responses use `Cache-Control: no-store`.
+
+A guild parameter must name a configured guild. Commands without a guild parameter apply to all configured guilds where the table permits that form.
 
 | Endpoint | Effect |
-|---|---|
-| `GET /status` | Gateway state (including `deadLetters`: events that failed 10 times and were set aside), plus per-guild buffered lines, media queue, last commit, last error and any GitHub rate-limit backoff. |
-| `POST /start`, `POST /stop` | Start the Gateway session (also clears a fatal error, e.g. after fixing the token), or stop it. |
-| `POST /flush[?guild=ID]` | Commit everything buffered now. |
-| `POST /pause[?guild=ID]`, `POST /resume[?guild=ID]` | Stop or restart committing. Events keep being buffered meanwhile. |
-| `POST /reset?guild=ID` | Wipe the bot's state for a guild and start it again right away: snapshot, channel selection and backfill. For test setups: delete the archive branch first, or the backfill appends duplicates. |
-| `POST /retry-media[?guild=ID]` | Re-queue media recorded as failed, e.g. after fixing the GitHub setup. When a key has several `MEDIA_*` records, the last one wins. |
+| --- | --- |
+| `GET /status[?guild=ID]` | Reports the connection, delivery queues, failed events, archive queues, blocked paths, and last errors. |
+| `POST /start` | Enables the Gateway and clears its fatal error. |
+| `POST /stop` | Disables the Gateway until an explicit start. Cron and pending connections respect this state. |
+| `POST /flush[?guild=ID]` | Waits for active work and commits the events buffered at entry. HTTP 503 reports failure or an incomplete flush. |
+| `POST /pause[?guild=ID]` | Stops background archive work and waits for active writes. Incoming events remain buffered. |
+| `POST /resume[?guild=ID]` | Enables background archive work. |
+| `POST /reset?guild=ID` | Deletes the stored state for one guild, then starts collection again. |
+| `POST /retry-media[?guild=ID]` | Returns failed media items to the work queue. |
+| `GET /dead-letters[?guild=ID][&after=N][&limit=N]` | Lists metadata for failed events. The default limit is 25 and the maximum is 100. |
+| `POST /retry-dead-letter?guild=ID&id=N` | Returns one eligible failed event to its original place in the delivery queue. |
+
+A dead letter is an event excluded from normal delivery. Temporary failures retry without a fixed attempt limit. New permanent failures block later events for that guild. Other guilds continue.
+
+Older dead letters predate ordered recovery. The retry command refuses them because later events can already affect archive state. Their metadata remains available for manual recovery.
+
+A flush response includes `committed`, `remaining`, and `complete` for each guild. It measures the events buffered when that flush starts. New events can remain after a complete flush. Blocked paths remain queued and appear in status.
+
+If reset fails, the command returns HTTP 503 without restarting collection. Reset does not delete GitHub commits or media. Repeated backfill can therefore append duplicate records.
 
 ## Removing messages from the archive
 
-Deletion is manual, by the archive admin:
-1. `POST /pause`, then `POST /flush`, in that order, so nothing is in flight and nothing new gets committed.
-2. Rewrite the `archive` branch however you like (e.g. `git filter-repo`), and force-push. To drop a whole channel: `git filter-repo --path-glob 'raw/*/*/*/<channel id>.jsonl' --invert-paths`, and the same for each of its threads (they have their own IDs). Some traces stay in `guild.jsonl` and need editing by hand: `THREAD_LIST_SYNC` events (thread objects, including names), `CATCHUP_BEGIN` records (channel IDs), and media records for anything without a channel of its own: emoji, stickers, avatars, embed images (`ext-…`) and attachments of forwarded messages. Attachment media records are filed with their channel.
-3. Delete the matching release assets.
-4. `POST /resume`.
+Generated views omit deleted messages and earlier edits. Raw records and media retain those versions until an administrator removes them.
 
-The bot always builds its next commit on the current branch tip and never force-pushes, so your rewrite stands. It doesn't re-fetch history it has already archived, but later events about a removed message (an edit or a reaction) are still logged as they happen.
+For a manual rewrite, use these steps:
 
-Anyone with a clone of the archive must `git fetch --force` / reset after a rewrite. Old commits can stay reachable on GitHub by SHA until GitHub garbage-collects them; GitHub Support can purge them.
+1. Send `POST /pause?guild=ID` to the Worker and wait for success.
+2. Send `POST /flush?guild=ID` and require `complete: true`.
+3. Rewrite the archive branch and remove the matching release assets.
+4. Rebuild the reader and Markdown logs from the rewritten archive.
+5. Send `POST /resume?guild=ID` after the rewrite and rebuild succeed.
+
+If the flush fails or remains incomplete, resolve its reported error before the rewrite. Paused guilds still collect incoming events. Explicit flushes can commit those buffered events while paused.
+
+To remove a channel with `git filter-repo`, use `--path-glob 'raw/*/*/*/<channel id>.jsonl' --invert-paths`. Apply the same rule to each thread. Inspect `guild.jsonl` for channel references and shared media records.
+
+The bot builds each commit on the current branch tip. It never force-pushes. Later edits or reactions can still add new records for a removed message.
+
+Archive readers with local clones must update those clones after a rewrite. Old commits can remain accessible by commit ID until GitHub removes them. GitHub Support handles requests to purge those objects.
 
 ## Reader
 
@@ -203,9 +235,16 @@ npx serve site    # or any static file server
 **Publish on GitHub Pages:**
 1. Copy [`templates/pages.yml`](templates/pages.yml) to `.github/workflows/pages.yml` on the archive repo's **default branch**.
 2. Set **Settings → Pages → Source** to *GitHub Actions*.
-3. Add `"pages": true` to the guild's config so the bot triggers a rebuild after commits. An hourly schedule also covers it.
+3. Set the repository variable `REJGAU_REF` to a full, reviewed commit ID from this repository.
+4. Add `"pages": true` to the guild configuration so the bot requests publication after commits.
+
+The workflow runs TypeScript and application tests before publication. Source CI also runs browser tests. Generated metadata records both source revisions.
 
 The same workflow also publishes the [readable logs](#readable-logs) to the `logs` branch.
+
+Builds reject malformed raw records by default. The reader data uses immutable generation paths, so an old page cannot combine data from separate builds. If its generation disappears, the reader requests a reload.
+
+The builders track generated files with an ownership manifest. They preserve unrelated files and remove stale generated files. They stage output before publication and restore prior files after a caught promotion failure. See [the build rules](docs/reader.md) for input limits and recovery after an interrupted build.
 
 A Pages site is **public even for a private repo**, except on GitHub Enterprise Cloud with access control. Media stored in a private repo's releases can't be displayed by the reader; it shows as links that signed-in viewers can open.
 

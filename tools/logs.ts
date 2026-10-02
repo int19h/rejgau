@@ -12,7 +12,7 @@
 import { posix } from "node:path";
 import { refForUrl, stickerRef } from "../src/media";
 import { MESSAGE_CHANNEL_TYPES, NORMAL_TYPES, SYSTEM_TEXT, THREAD_TYPES } from "../reader/src/data";
-import { isPublished, previewText, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, previewText, publishedReactorUsers, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { customEmoji, escapeHtml, escapeLine, escapeText, inlineCode, link, linkUrl, paragraphs, quote, renderMarkdown, type GfmContext } from "./gfm";
 
 const DISCORD_EPOCH = 1420070400000n;
@@ -38,12 +38,18 @@ function relLink(from: string, to: string): string {
 
 /** A folder name for a channel: its name with path-unsafe characters replaced. */
 function slug(name: string | undefined, id: string): string {
-  const s = String(name ?? "")
+  const normalized = Buffer.from(String(name ?? "")).toString("utf8")
     .normalize("NFC")
     .replace(/[\u0000-\u001f\u007f/\\:*?"<>|#%]/g, "-")
     .replace(/\s+/g, "-")
-    .replace(/^[.-]+|[.-]+$/g, "")
-    .slice(0, 80);
+    .replace(/^[.-]+|[.-]+$/g, "");
+  // Leave room for an ID, a collision counter, and the file extension.
+  let s = "";
+  for (const char of normalized) {
+    if (Buffer.byteLength(s + char) > 180) break;
+    s += char;
+  }
+  if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(s)) s = `_${s}`;
   return s || id;
 }
 
@@ -109,10 +115,12 @@ function layout(state: ArchiveState): Layout {
   const dir = new Map<string, string>();
   const page = new Map<string, string>();
   // The root index is README.md, so no channel may take that name.
-  const taken = new Set<string>(["readme.md"]);
+  const taken = new Set<string>(["readme.md", "build-info.json"]);
   /** A unique path (compared case-insensitively, for case-insensitive file systems). */
   const claim = (path: string, id: string) => {
-    const name = taken.has(path.toLowerCase()) ? `${path}-${id}` : path;
+    let name = path;
+    let suffix = 1;
+    while (taken.has(name.toLowerCase())) name = `${path}-${id}${suffix++ > 1 ? `-${suffix - 1}` : ""}`;
     taken.add(name.toLowerCase());
     return name;
   };
@@ -138,8 +146,11 @@ function layout(state: ArchiveState): Layout {
     if (first) page.set(id, first);
   }
   const names = new Map<string, string>();
-  for (const [id, r] of state.reactors) names.set(id, displayName(r.user, r.member));
-  for (const ms of [...state.messages.values()].sort(byId)) {
+  const published = [...state.messages.values()].filter((ms) => isPublished(state, ms.channelId) && !ms.deletedAt);
+  for (const ms of published) {
+    for (const [id, profile] of publishedReactorUsers(state, ms)) names.set(id, displayName(profile.user, profile.member));
+  }
+  for (const ms of published.sort(byId)) {
     const m = ms.m;
     if (m.author?.id) names.set(m.author.id, displayName(m.author, m.member ?? state.memberSnapshots.get(m.author.id)));
     for (const u of m.mentions ?? []) if (u?.id) names.set(u.id, displayName(u, u.member));

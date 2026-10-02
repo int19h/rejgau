@@ -1,29 +1,16 @@
 // Turns folded archive state into the reader's data files. Pure: returns path → JSON value.
 
 import { avatarRef, emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "../src/media";
-import { isPublished, previewText, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, previewText, publishedReactorUsers, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { normalizeText } from "../reader/src/text";
 
-/** How a person appeared on one message: the author (or invoker, mentioned user…) as logged then. */
-export interface UserSnap {
-  id: string;
-  username?: string;
-  global_name?: string | null;
-  avatar?: string | null;
-  bot?: boolean;
-  system?: boolean;
-  nick?: string | null;
-  /** The nickname/roles come from a MEMBER_SNAPSHOT taken at backfill time, not from the message. */
-  member_asof?: "backfill";
-  member_avatar?: string | null;
-  roles?: string[];
-  tag?: string | null;
-}
+import { parseArchive, parseMonthFile, parseSearchRows, parseUsersFile, type Archive, type ChannelInfo, type MonthFile, type PublicationFile, type PublishedMessage, type SearchRow, type UserSnap, type UsersFile } from "../shared/publication";
+export type { UserSnap } from "../shared/publication";
 
 const DISCORD_EPOCH = 1420070400000n;
 export const snowflakeTime = (id: string) => Number((BigInt(id) >> 22n) + DISCORD_EPOCH);
 const monthOf = (id: string) => new Date(snowflakeTime(id)).toISOString().slice(0, 7);
-const byId = (a: { m: any }, b: { m: any }) => (BigInt(a.m.id) < BigInt(b.m.id) ? -1 : BigInt(a.m.id) > BigInt(b.m.id) ? 1 : 0);
+const byId = (a: MessageState, b: MessageState) => (BigInt(a.m.id) < BigInt(b.m.id) ? -1 : BigInt(a.m.id) > BigInt(b.m.id) ? 1 : 0);
 
 function snapUser(user: any, member: any | null | undefined, asof?: "backfill"): UserSnap | null {
   if (!user?.id) return null;
@@ -114,11 +101,11 @@ interface Context {
   threadCounts: Map<string, number>;
 }
 
-function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set<string>): any {
+function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set<string>): PublishedMessage {
   const { state } = ctx;
   const m = ms.m;
   const fallback = !m.member && m.author?.id ? state.memberSnapshots.get(m.author.id) : undefined;
-  const out: any = {
+  const out: PublishedMessage = {
     id: m.id,
     ts: m.timestamp ?? new Date(snowflakeTime(m.id)).toISOString(),
     type: m.type ?? 0,
@@ -129,7 +116,7 @@ function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set
   for (const k of copy) {
     const v = m[k];
     if (v === undefined || v === null || v === false || (Array.isArray(v) && v.length === 0)) continue;
-    out[k] = v;
+    Object.assign(out, { [k]: v });
   }
   if (ms.pinned) out.pinned = true;
   if (Array.isArray(m.mentions) && m.mentions.length) {
@@ -189,9 +176,9 @@ function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set
   return out;
 }
 
-function searchRow(msg: any, channelId: string, snaps: SnapTable, m: any): any {
+function searchRow(msg: PublishedMessage, channelId: string, snaps: SnapTable, m: any): SearchRow {
   const author = msg.author ? snaps.users[msg.author] : undefined;
-  const row: any = {
+  const row: SearchRow = {
     id: msg.id,
     c: channelId,
     ts: msg.ts,
@@ -206,16 +193,15 @@ function searchRow(msg: any, channelId: string, snaps: SnapTable, m: any): any {
   const men = (m.mentions ?? []).map((u: any) => u.id);
   if (men.length) row.men = men;
   if (msg.pinned) row.pin = true;
-  if (msg.deleted_at) row.del = true;
   return row;
 }
 
 export interface SiteData {
-  files: Map<string, unknown>;
+  files: Map<string, PublicationFile>;
 }
 
 export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOString()): SiteData {
-  const files = new Map<string, unknown>();
+  const files = new Map<string, PublicationFile>();
   const guildId = state.guild.id ?? "";
   const media = (key: string) => {
     const e = state.media.get(key);
@@ -237,7 +223,7 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
 
   const months: Record<string, Record<string, number>> = {};
   const latestUsers = new Map<string, { snap: UserSnap; ts: string; names: Set<string> }>();
-  const search = new Map<string, any[]>();
+  const search = new Map<string, SearchRow[]>();
   const noteUser = (u: UserSnap | undefined, ts: string) => {
     if (!u) return;
     const cur = latestUsers.get(u.id) ?? { snap: u, ts, names: new Set<string>() };
@@ -257,22 +243,28 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
     const messages = list.map((ms) => messageOut(ms, ctx, snaps, keys));
     const mediaMap: Record<string, string | null> = {};
     for (const k of keys) mediaMap[k] = media(k);
-    files.set(`c/${key}.json`, { channel: channelId, month, media: mediaMap, users: snaps.users, messages });
+    const file: MonthFile = { channel: channelId, month, media: mediaMap, users: snaps.users, messages };
+    files.set(`c/${key}.json`, parseMonthFile(file));
     (months[channelId] ??= {})[month] = messages.length;
     messages.forEach((msg, i) => {
       noteUser(msg.author ? snaps.users[msg.author] : undefined, msg.ts);
       for (const k of msg.mentions ?? []) noteUser(snaps.users[k], msg.ts);
+      if (msg.referenced && !msg.referenced.deleted && msg.referenced.author) noteUser(snaps.users[msg.referenced.author], msg.ts);
+      if (msg.interaction?.user) noteUser(snaps.users[msg.interaction.user], msg.ts);
+      for (const [, profile] of publishedReactorUsers(state, list[i])) {
+        noteUser(snapUser(profile.user, profile.member) ?? undefined, profile.at);
+      }
       if (!search.has(month)) search.set(month, []);
       search.get(month)!.push(searchRow(msg, channelId, snaps, list[i].m));
     });
   }
   for (const [month, rows] of search) {
     rows.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1)); // newest first
-    files.set(`search/${month}.json`, rows);
+    files.set(`search/${month}.json`, parseSearchRows(rows));
   }
 
   // Channel tree: selected channels and their ancestors.
-  const channels: Record<string, unknown> = {};
+  const channels: Record<string, ChannelInfo> = {};
   const include = (id: string | null | undefined, depth = 0): void => {
     if (!id || depth > 4 || channels[id]) return;
     const ch = state.channels.get(id);
@@ -294,12 +286,7 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
   };
   for (const id of state.channels.keys()) if (isPublished(state, id)) include(id);
 
-  // People seen only reacting still need names for reaction tooltips.
-  for (const [id, r] of state.reactors) {
-    if (!latestUsers.has(id)) noteUser(snapUser(r.user, r.member) ?? undefined, r.at);
-  }
-
-  const users: Record<string, unknown> = {};
+  const users: Record<string, UserSnap> = {};
   const userMedia: Record<string, string | null> = {};
   for (const [id, u] of latestUsers) {
     users[id] = { ...u.snap, names: [...u.names] };
@@ -311,13 +298,15 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
 
   const g = state.guild;
   const icon = g.icon && g.id ? guildIconRef(g.id, g.icon) : null;
-  files.set("archive.json", {
+  const archive: Archive = {
     format: 1,
     built_at: builtAt,
-    guild: { id: g.id, name: g.name, icon_url: icon ? media(icon.key) : null, roles: g.roles ?? [], emojis: g.emojis ?? [], stickers: g.stickers ?? [] },
+    guild: { id: g.id ?? "", name: g.name ?? "Discord archive", icon_url: icon ? media(icon.key) : null, roles: g.roles ?? [], emojis: g.emojis ?? [], stickers: g.stickers ?? [] },
     channels,
     search_months: [...search.keys()].sort().reverse(),
-  });
-  files.set("users.json", { users, media: userMedia });
+  };
+  const userFile: UsersFile = { users, media: userMedia };
+  files.set("archive.json", parseArchive(archive));
+  files.set("users.json", parseUsersFile(userFile));
   return { files };
 }

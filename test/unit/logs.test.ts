@@ -164,3 +164,33 @@ describe("orphaned threads", () => {
     expect([...files.keys()]).toEqual(["README.md"]);
   });
 });
+
+describe("path collision chains", () => {
+  it("keeps every channel and gives each index link a distinct target", () => {
+    const inputs: RawLine[] = [];
+    for (const [id, name, position] of [["11", "foo", 1], ["12", "foo-13", 2], ["14", "foo-13-2", 3], ["13", "foo", 4]] as const) {
+      inputs.push(line("CHANNEL_SELECTED", { channel: { id, name, type: 0, position } }, 0, "rejgau"));
+      inputs.push(line("MESSAGE_CREATE", M(String(BigInt(ID1) + BigInt(id)), id, { content: `marker-${id}` }), 1));
+    }
+    const output = buildLogs(fold(inputs));
+    expect([...output.keys()].filter((path) => path.endsWith("/README.md"))).toEqual(["foo/README.md", "foo-13/README.md", "foo-13-2/README.md", "foo-13-3/README.md"]);
+    for (const id of ["11", "12", "13", "14"]) expect([...output.values()].some((text) => text.includes(`marker-${id}`))).toBe(true);
+    expect(output.get("README.md")).toContain("(foo-13-3/README.md)");
+  });
+
+  it("keeps thread collision chains distinct and limits UTF-8 segment lengths", () => {
+    const t1 = "1554541602075316300";
+    const t2 = "1554541602075316301";
+    const t3 = "1554541602075316302";
+    const inputs: RawLine[] = [line("CHANNEL_SELECTED", { channel: { id: "11", name: "雪".repeat(100), type: 0 } }, 0, "rejgau")];
+    for (const [id, name] of [[t1, "topic"], [t2, `topic-${t3}`], [t3, "topic"]]) {
+      inputs.push(line("CHANNEL_SELECTED", { channel: { id, name, type: 11, parent_id: "11" } }, 1, "rejgau"));
+      inputs.push(line("MESSAGE_CREATE", M(String(BigInt(id) + 200n), id), 2));
+    }
+    const output = buildLogs(fold(inputs));
+    const threadPaths = [...output.keys()].filter((path) => path.includes("/29/"));
+    expect(new Set(threadPaths).size).toBe(3);
+    expect(threadPaths.some((path) => path.endsWith(`topic-${t3}-2.md`))).toBe(true);
+    for (const path of output.keys()) for (const part of path.split("/")) expect(Buffer.byteLength(part)).toBeLessThan(256);
+  });
+});
