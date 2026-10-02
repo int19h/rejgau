@@ -39,6 +39,14 @@ Reader requests use cancellation and route identity. Completed data uses a bound
 
 Source CI runs TypeScript, unit tests, Worker tests, browser tests, and a local Worker bundle. The Pages template requires an exact renderer commit and runs application tests before publication. Generated metadata records the archive and renderer revisions.
 
+## Validation results
+
+The combined unit and Worker suite passed 240 tests across 26 files. Chromium passed all 18 browser tests. TypeScript passed for the application, tools, and tests.
+
+The Worker dry run produced a bundle without deployment. `npm audit` reported no known dependency vulnerabilities. Independent source reviews found no remaining blocking findings in the changed areas.
+
+Both builders processed archive commit `1fc498ef7fad99601cfaf9d3ed5e50bcd6b1bca4` successfully. That snapshot contains 66 raw records and produces 31 current messages. The generated metadata reports zero skipped records.
+
 ## Release preparation
 
 Use a clean checkout of the exact reviewed commit. The deployment wrapper records that commit on the Worker version. A dry run creates a local bundle without a production update.

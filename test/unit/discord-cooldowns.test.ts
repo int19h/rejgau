@@ -61,7 +61,7 @@ it.each(["null", "[]", "false", "invalid JSON"])("preserves rate-limit headers w
   const { env, observations } = environment();
   vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 429, headers: { "retry-after": "120", "x-ratelimit-global": "true" } })));
   const error = await discordGet(env, "/users/@me").catch((e) => e);
-  expect(error).toBeInstanceOf(DiscordRateLimitError);
+  if (!(error instanceof DiscordRateLimitError)) throw new Error("Expected a Discord rate limit.");
   expect(error.retryAt).toBe(now + 120_100);
   expect(observations[0]).toMatchObject({ global: true, retryAt: now + 120_100 });
 });
@@ -74,7 +74,7 @@ it("persists rate-limit headers before waiting for a stalled response body", asy
   vi.stubGlobal("fetch", fetch);
   const request = discordGet(env, "/users/@me").catch((error) => error);
   await vi.advanceTimersByTimeAsync(30_000);
-  expect((await request).name).toBe("RequestTimeoutError");
+  expect(await request).toMatchObject({ name: "RequestTimeoutError" });
   expect(observations[0]).toMatchObject({ global: true, retryAt: now + 120_100 });
   await expect(discordGet(env, "/guilds/107/roles")).rejects.toBeInstanceOf(DiscordRateLimitError);
   expect(fetch).toHaveBeenCalledTimes(1);
