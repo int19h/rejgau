@@ -1,6 +1,7 @@
 // Minimal GitHub REST client for a GitHub App installed on the archive repo.
 
 import { log } from "./util";
+import { fetchWithDeadline, readTextBounded, REQUEST_TIMEOUT_MS, withDeadline } from "./http";
 
 const API = "https://api.github.com";
 const UPLOADS = "https://uploads.github.com";
@@ -145,6 +146,7 @@ export class GitHub {
     private readonly appId: string,
     private readonly privateKey: string,
     readonly repo: string,
+    private readonly requestTimeoutMs = REQUEST_TIMEOUT_MS,
   ) {
     [this.owner, this.name] = repo.split("/");
   }
@@ -171,7 +173,7 @@ export class GitHub {
   private async raw(method: string, pathOrUrl: string, body?: unknown, auth?: string, accept = "application/vnd.github+json"): Promise<Response> {
     const url = pathOrUrl.startsWith("https://") ? pathOrUrl : API + pathOrUrl;
     for (let attempt = 0; ; attempt++) {
-      const res = await fetch(url, {
+      const res = await fetchWithDeadline(url, {
         method,
         headers: {
           Accept: accept,
@@ -181,7 +183,7 @@ export class GitHub {
           ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
-      });
+      }, this.requestTimeoutMs);
       if (res.status >= 500 && attempt < 2) {
         await res.body?.cancel();
         await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
@@ -213,7 +215,7 @@ export class GitHub {
   }
 
   /** Text of a file at a commit, or null if absent. */
-  async readFile(path: string, ref: string): Promise<string | null> {
+  async readFile(path: string, ref: string, maxBytes = 8 * 1024 * 1024): Promise<string | null> {
     const encoded = path.split("/").map(encodeURIComponent).join("/");
     const res = await this.raw("GET", this.repoPath(`/contents/${encoded}?ref=${ref}`), undefined, undefined, "application/vnd.github.raw+json");
     if (res.status === 404) {
@@ -221,7 +223,7 @@ export class GitHub {
       return null;
     }
     if (!res.ok) throw await failure(res, `read ${path}`);
-    return await res.text();
+    return await readTextBounded(res, maxBytes);
   }
 
   /**
@@ -366,30 +368,54 @@ export class GitHub {
 
   /** Uploads a release asset. Returns null if an asset with that name already exists. */
   async uploadAsset(releaseId: number, name: string, contentType: string, length: number, body: ReadableStream | ArrayBuffer): Promise<Asset | null> {
-    let payload: ReadableStream | ArrayBuffer = body;
-    if (body instanceof ReadableStream) {
-      // GitHub requires Content-Length; a FixedLengthStream makes fetch send it instead of chunking.
-      const fixed = new FixedLengthStream(length);
-      body.pipeTo(fixed.writable).catch(() => {});
-      payload = fixed.readable;
-    }
-    const res = await fetch(`${UPLOADS}/repos/${this.repo}/releases/${releaseId}/assets?name=${encodeURIComponent(name)}`, {
-      method: "POST",
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${await this.token()}`,
-        "User-Agent": "rejgau",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": contentType,
-      },
-      body: payload,
-    });
-    if (res.status === 422) {
-      const text = await res.text();
-      if (text.includes("already_exists")) return null;
-      throw new GitHubError(422, text, `upload ${name}`);
-    }
-    if (!res.ok) throw await failure(res, `upload ${name}`);
-    return (await res.json()) as Asset;
+    return withDeadline(async (signal) => {
+      let payload: ReadableStream | ArrayBuffer = body;
+      let cancelSource: (() => void) | undefined;
+      if (body instanceof ReadableStream) {
+        // GitHub requires Content-Length; a FixedLengthStream makes fetch send it instead of chunking.
+        const fixed = new FixedLengthStream(length);
+        const reader = body.getReader();
+        cancelSource = () => {
+          void reader.cancel(signal.reason).catch(() => {});
+          // An early server response can leave the outgoing body unread.
+          void fixed.readable.cancel(signal.reason).catch(() => {});
+        };
+        signal.addEventListener("abort", cancelSource, { once: true });
+        const source = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            const next = await reader.read();
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
+          },
+          cancel: cancelSource,
+        });
+        // Cancel the original reader even if the fixed stream waits for a consumer.
+        void source.pipeTo(fixed.writable, { signal }).finally(() => {
+          signal.removeEventListener("abort", cancelSource!);
+        }).catch(() => {});
+        payload = fixed.readable;
+      }
+      try {
+        const res = await fetch(`${UPLOADS}/repos/${this.repo}/releases/${releaseId}/assets?name=${encodeURIComponent(name)}`, {
+          method: "POST",
+          signal,
+          headers: {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${await this.token()}`,
+            "User-Agent": "rejgau",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": contentType,
+          },
+          body: payload,
+        });
+        if (res.status === 422) {
+          const text = await res.text();
+          if (text.includes("already_exists")) return null;
+          throw new GitHubError(422, text, `upload ${name}`);
+        }
+        if (!res.ok) throw await failure(res, `upload ${name}`);
+        return (await res.json()) as Asset;
+      } finally { cancelSource?.(); }
+    }, this.requestTimeoutMs);
   }
 }

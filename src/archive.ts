@@ -10,12 +10,16 @@
 // rewrites never have to be reconciled with bot-owned state files.
 
 import { DurableObject } from "cloudflare:workers";
+import { ArchiveLifecycle } from "./archive-lifecycle";
+import { ArchiveMediaQueue } from "./archive-media";
+import { initializeArchiveStorage } from "./archive-storage";
+import { ArchiveCommitter } from "./archive-committer";
 import { canView, isAdministrator, isArchived, isThread, lineScope, publishedChannelIds, type ChannelInfo, type PermissionContext } from "./channels";
 import { parseConfig, type Config, type GuildConfig } from "./config";
-import { discordGet, DiscordError } from "./discord";
+import { discordGet, DiscordError, DiscordRateLimitError } from "./discord";
 import type { Env, OutboxEvent } from "./env";
-import { ConflictError, GitHub, GitHubAuthError, GitHubError } from "./github";
-import { emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "./media";
+import { GitHub, GitHubError } from "./github";
+import { emojiRef, guildIconRef, mediaInMessage } from "./media";
 import { MEMBER_FIELDS, publicSessionId, sanitize } from "./sanitize";
 import { dayPath, errorMessage, joinPath, log, maxSnowflake, monthTag, rawLine, snowflakeTime } from "./util";
 
@@ -43,11 +47,7 @@ const PERMISSION_RETRY_MS = 5 * 60_000;
 /** After permissions were refused for good (and aren't known), drop batches this long before retrying. */
 const PERMISSION_FAILED_WAIT_MS = 10 * 60_000;
 
-const MAX_FLUSH_PATHS = 40;
-const MAX_FLUSH_BYTES = 8 * 1024 * 1024;
 const REST_PAGES_PER_ALARM = 10;
-const MEDIA_MAX_ATTEMPTS = 4;
-const RELEASE_ASSET_LIMIT = 1000;
 const DISPATCH_INTERVAL_MS = 10 * 60_000;
 /** Channel types with no message history endpoint of their own (category, forum, media). */
 const NO_HISTORY_TYPES = new Set([4, 15, 16]);
@@ -57,7 +57,7 @@ export interface IngestResult {
   /** Number of leading events that were handled (archived, skipped or dropped). */
   handled: number;
   /** Set when the next event failed. */
-  failed?: { retryable: boolean; error: string };
+  failed?: { retryable: boolean; error: string; retryAt?: number };
 }
 
 /** Whether retrying could help: Discord/GitHub 5xx or 429, or a network-level failure. */
@@ -74,20 +74,12 @@ type ChannelRow = {
   flags: number;
   deleted: number;
   selected: number;
+  missing: number;
   last_message_id: string | null;
   cursor: string | null;
   cursor_kind: string | null;
   rest_next_at: number;
   rest_failures: number;
-};
-
-type MediaRow = {
-  key: string;
-  url: string | null;
-  channel_id: string | null;
-  message_id: string | null;
-  month: string;
-  attempts: number;
 };
 
 function pick(obj: Record<string, unknown>, fields: string[]): Record<string, unknown> {
@@ -100,28 +92,31 @@ function pick(obj: Record<string, unknown>, fields: string[]): Record<string, un
 export class GuildArchive extends DurableObject<Env> {
   private sql: SqlStorage;
   private channels = new Map<string, ChannelInfo>();
-  private busy = false;
+  private readonly lifecycle = new ArchiveLifecycle();
+  private readonly media: ArchiveMediaQueue;
+  private readonly committer: ArchiveCommitter;
   private github: GitHub | null = null;
   /** Channel IDs Discord says we can't see (403/404); not retried until the DO restarts. */
   private unresolvable = new Set<string>();
-  /** Serializes ingest calls: a restarted GatewaySession may resend a batch while one is in flight. */
-  private ingestChain: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    this.committer = new ArchiveCommitter({
+      sql: this.sql,
+      get: (key) => this.get(key),
+      set: (key, value) => this.set(key, value),
+      github: (guild) => this.gh(guild),
+    });
+    this.media = new ArchiveMediaQueue({
+      sql: this.sql, env,
+      get: (key) => this.get(key),
+      set: (key, value) => this.set(key, value),
+      github: (guild) => this.gh(guild),
+      emit: (guild, type, data) => this.synthetic(guild, type, data),
+    });
     ctx.blockConcurrencyWhile(async () => {
-      this.sql.exec(`CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)`);
-      this.sql.exec(`CREATE TABLE IF NOT EXISTS pending (n INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, line TEXT NOT NULL, at INTEGER NOT NULL)`);
-      this.sql.exec(`CREATE TABLE IF NOT EXISTS channels (
-        id TEXT PRIMARY KEY, json TEXT NOT NULL, type INTEGER NOT NULL, parent_id TEXT, flags INTEGER NOT NULL DEFAULT 0,
-        deleted INTEGER NOT NULL DEFAULT 0, selected INTEGER NOT NULL DEFAULT 0, last_message_id TEXT,
-        cursor TEXT, cursor_kind TEXT, rest_next_at INTEGER NOT NULL DEFAULT 0, rest_failures INTEGER NOT NULL DEFAULT 0)`);
-      this.sql.exec(`CREATE TABLE IF NOT EXISTS media (
-        key TEXT PRIMARY KEY, url TEXT, channel_id TEXT, message_id TEXT, month TEXT NOT NULL,
-        status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0)`);
-      // Authors of backfilled messages whose server membership still needs a MEMBER_SNAPSHOT.
-      this.sql.exec(`CREATE TABLE IF NOT EXISTS members (user_id TEXT PRIMARY KEY, done INTEGER NOT NULL DEFAULT 0)`);
+      initializeArchiveStorage(this.sql);
       for (const r of this.sql.exec<ChannelRow>(`SELECT * FROM channels`)) this.channels.set(r.id, toInfo(r));
       this.applyVisibility();
     });
@@ -171,7 +166,7 @@ export class GuildArchive extends DurableObject<Env> {
     // Every line passes through the privacy filter (see sanitize.ts), and session IDs are replaced
     // by an opaque stand-in.
     const publicLine = { ...line, sid: line.sid === undefined ? undefined : publicSessionId(line.sid) };
-    const d = JSON.stringify(sanitize(parsed));
+    const d = JSON.stringify(sanitize(parsed, line.t));
     this.sql.exec(`INSERT INTO pending (path, line, at) VALUES (?, ?, ?)`, path, rawLine(publicLine, d), Date.now());
     if (!this.get("dirtySince")) this.set("dirtySince", String(Date.now()));
     this.set("lastChangeAt", String(Date.now()));
@@ -191,6 +186,8 @@ export class GuildArchive extends DurableObject<Env> {
        ON CONFLICT(id) DO UPDATE SET json = excluded.json, type = excluded.type, parent_id = excluded.parent_id, flags = excluded.flags, deleted = 0`,
       ch.id, JSON.stringify(merged), merged.type ?? 0, merged.parent_id ?? null, merged.flags ?? 0,
     );
+    this.sql.exec(`UPDATE channels SET missing = 0 WHERE id = ?`, ch.id);
+    this.unresolvable.delete(ch.id);
     const info: ChannelInfo = { id: ch.id, type: merged.type ?? 0, parentId: merged.parent_id ?? null, flags: merged.flags ?? 0, deleted: false };
     info.hidden = this.isHidden(info, merged, this.permissions());
     this.channels.set(ch.id, info);
@@ -218,7 +215,7 @@ export class GuildArchive extends DurableObject<Env> {
     const p = this.permissions();
     for (const r of this.sql.exec<ChannelRow>(`SELECT * FROM channels`)) {
       const info = this.channels.get(r.id);
-      if (info) info.hidden = this.isHidden(info, JSON.parse(r.json), p);
+      if (info) info.hidden = r.missing === 1 || this.isHidden(info, JSON.parse(r.json), p);
     }
   }
 
@@ -250,14 +247,14 @@ export class GuildArchive extends DurableObject<Env> {
   private async refreshPermissions(guildId: string, force = false): Promise<boolean> {
     const age = Date.now() - Number(this.get("permAt") ?? "0");
     if (!force && this.permissions() && age < PERMISSION_REFRESH_MS) return false;
-    const token = this.env.DISCORD_TOKEN;
+    const discordEnv = this.env;
     let userId = this.get("botUserId");
     if (!userId) {
-      userId = (await discordGet<{ id: string }>(token, "/users/@me")).id;
+      userId = (await discordGet<{ id: string }>(discordEnv, "/users/@me")).id;
       this.set("botUserId", userId);
     }
-    const roles = await discordGet<{ id: string; permissions: string }[]>(token, `/guilds/${guildId}/roles`);
-    const me = await discordGet<{ roles?: string[] }>(token, `/guilds/${guildId}/members/${userId}`);
+    const roles = await discordGet<{ id: string; permissions: string }[]>(discordEnv, `/guilds/${guildId}/roles`);
+    const me = await discordGet<{ roles?: string[] }>(discordEnv, `/guilds/${guildId}/members/${userId}`);
     return this.setPermissions(roles, me.roles ?? []);
   }
 
@@ -272,7 +269,7 @@ export class GuildArchive extends DurableObject<Env> {
     } catch (e) {
       if (!this.permissions()) throw e;
       log("permission_refresh_failed", { error: errorMessage(e) });
-      this.set("permRetryAt", String(Date.now() + PERMISSION_RETRY_MS));
+      this.set("permRetryAt", String(e instanceof DiscordRateLimitError ? e.retryAt : Date.now() + PERMISSION_RETRY_MS));
       return false;
     }
   }
@@ -339,7 +336,7 @@ export class GuildArchive extends DurableObject<Env> {
       if (this.unresolvable.has(want)) return learned;
       let ch: Record<string, any>;
       try {
-        ch = await discordGet<Record<string, any>>(this.env.DISCORD_TOKEN, `/channels/${want}`);
+        ch = await discordGet<Record<string, any>>(this.env, `/channels/${want}`);
       } catch (e) {
         if (e instanceof DiscordError && (e.status === 403 || e.status === 404)) {
           this.unresolvable.add(want);
@@ -359,22 +356,11 @@ export class GuildArchive extends DurableObject<Env> {
    * GUILD_CREATE, e.g. for a guild newly added to the config while the session merely resumed.
    */
   private async bootstrap(guild: GuildConfig, guildId: string): Promise<void> {
-    const token = this.env.DISCORD_TOKEN;
-    const g = await discordGet<Record<string, any>>(token, `/guilds/${guildId}`);
-    const channels = await discordGet<Record<string, any>[]>(token, `/guilds/${guildId}/channels`);
-    const active = await discordGet<{ threads: Record<string, any>[] }>(token, `/guilds/${guildId}/threads/active`);
+    const discordEnv = this.env;
+    const g = await discordGet<Record<string, any>>(discordEnv, `/guilds/${guildId}`);
+    const channels = await discordGet<Record<string, any>[]>(discordEnv, `/guilds/${guildId}/channels`);
+    const active = await discordGet<{ threads: Record<string, any>[] }>(discordEnv, `/guilds/${guildId}/threads/active`);
     this.applyGuildCreate(guild, { ...g, channels, threads: active.threads ?? [] }, { at: Date.now(), src: "rest" });
-  }
-
-  // --- media ---
-
-  private enqueueMedia(refs: MediaRef[], month: string): void {
-    for (const r of refs) {
-      this.sql.exec(
-        `INSERT OR IGNORE INTO media (key, url, channel_id, message_id, month, status) VALUES (?, ?, ?, ?, ?, 'pending')`,
-        r.key, r.url, r.channelId ?? null, r.messageId ?? null, month,
-      );
-    }
   }
 
   // --- ingest ---
@@ -385,9 +371,7 @@ export class GuildArchive extends DurableObject<Env> {
    * don't survive RPC, so the result is the reliable channel.)
    */
   ingest(guildId: string, events: OutboxEvent[]): Promise<IngestResult> {
-    const run = this.ingestChain.then(() => this.ingestSerial(guildId, events));
-    this.ingestChain = run.then(() => {}, () => {});
-    return run;
+    return this.lifecycle.ingest(() => this.ingestSerial(guildId, events));
   }
 
   private async ingestSerial(guildId: string, events: OutboxEvent[]): Promise<IngestResult> {
@@ -405,7 +389,7 @@ export class GuildArchive extends DurableObject<Env> {
       log("permissions_unknown", { error: errorMessage(e) });
       if (isTransient(e)) {
         // Not any event's fault: have the whole batch retried.
-        return { handled: 0, failed: { retryable: true, error: `permissions unknown: ${errorMessage(e).slice(0, 400)}` } };
+        return { handled: 0, failed: { retryable: true, error: `permissions unknown: ${errorMessage(e).slice(0, 400)}`, ...(e instanceof DiscordRateLimitError ? { retryAt: e.retryAt } : {}) } };
       }
       // Refused for good (e.g. the bot isn't in this guild): like a refused bootstrap, drop the batch
       // rather than hold up the pump (and every other guild), report it, and try again later.
@@ -436,7 +420,7 @@ export class GuildArchive extends DurableObject<Env> {
       }
     } catch (e) {
       log("ingest_error", { handled, error: errorMessage(e) });
-      return { handled, failed: { retryable: isTransient(e), error: errorMessage(e).slice(0, 500) } };
+      return { handled, failed: { retryable: isTransient(e), error: errorMessage(e).slice(0, 500), ...(e instanceof DiscordRateLimitError ? { retryAt: e.retryAt } : {}) } };
     } finally {
       await this.scheduleAlarm();
     }
@@ -489,7 +473,7 @@ export class GuildArchive extends DurableObject<Env> {
 
       case "GUILD_UPDATE":
         this.emit(guild, gw, JSON.stringify(pick(d, GUILD_FIELDS)));
-        if (d.icon) this.enqueueMedia([guildIconRef(d.id, d.icon)], monthTag(ev.at));
+        if (d.icon) this.media.enqueue([guildIconRef(d.id, d.icon)], monthTag(ev.at));
         return;
 
       case "GUILD_DELETE":
@@ -564,10 +548,10 @@ export class GuildArchive extends DurableObject<Env> {
 
     const guildId = this.get("guildId")!;
     if (ev.t === "MESSAGE_CREATE" || ev.t === "MESSAGE_UPDATE") {
-      this.enqueueMedia(mediaInMessage(d, guildId), monthTag(d.id ? snowflakeTime(d.id) : ev.at));
+      this.media.enqueue(mediaInMessage(d, guildId), monthTag(d.id ? snowflakeTime(d.id) : ev.at));
       if (ev.t === "MESSAGE_CREATE") this.noteMessage(channelId, d.id);
     } else if (ev.t === "MESSAGE_REACTION_ADD" && d.emoji?.id) {
-      this.enqueueMedia([emojiRef(d.emoji.id, !!d.emoji.animated)], monthTag(ev.at));
+      this.media.enqueue([emojiRef(d.emoji.id, !!d.emoji.animated)], monthTag(ev.at));
     }
   }
 
@@ -583,11 +567,20 @@ export class GuildArchive extends DurableObject<Env> {
   private applyGuildCreate(guild: GuildConfig, d: Record<string, any>, line: { at: number; src: string; sid?: string; s?: number }): void {
     const initialized = this.get("initialized") === "1";
     this.emit(guild, { ...line, t: "GUILD_SNAPSHOT" }, JSON.stringify(pick(d, GUILD_FIELDS)));
-    if (d.icon) this.enqueueMedia([guildIconRef(d.id, d.icon)], monthTag(line.at));
+    if (d.icon) this.media.enqueue([guildIconRef(d.id, d.icon)], monthTag(line.at));
     const botId = this.get("botUserId");
     const me = (d.members ?? []).find((m: any) => botId && m?.user?.id === botId);
     this.setPermissions(d.roles, me?.roles);
     const known = new Set(this.channels.keys());
+    if (Array.isArray(d.channels)) {
+      const present = new Set(d.channels.map((ch: any) => ch.id));
+      for (const [id, info] of this.channels) {
+        if (!isThread(info) && !present.has(id)) {
+          this.sql.exec(`UPDATE channels SET missing = 1 WHERE id = ?`, id);
+          info.hidden = true;
+        }
+      }
+    }
     for (const ch of d.channels ?? []) this.upsertChannel({ ...ch, guild_id: d.id });
     for (const th of d.threads ?? []) this.upsertChannel({ ...th, guild_id: d.id });
     if (!initialized) {
@@ -631,7 +624,9 @@ export class GuildArchive extends DurableObject<Env> {
     const dirtySince = this.get("dirtySince");
     if (dirtySince && !paused) {
       const lastChange = Number(this.get("lastChangeAt") ?? dirtySince);
-      times.push(Math.max(retryAt, Math.min(lastChange + conf.cfg.flushIdleMs, Number(dirtySince) + conf.cfg.flushMaxMs)));
+      const ready = this.sql.exec(`SELECT 1 FROM pending WHERE path NOT IN (SELECT path FROM blocked_paths WHERE retry_at > ?) LIMIT 1`, now).toArray().length;
+      const blockedAt = ready ? 0 : this.sql.exec<{ t: number | null }>(`SELECT MIN(retry_at) AS t FROM blocked_paths`).one().t ?? 0;
+      times.push(Math.max(retryAt, blockedAt, Math.min(lastChange + conf.cfg.flushIdleMs, Number(dirtySince) + conf.cfg.flushMaxMs)));
     }
     if (!paused) {
       if (this.sql.exec(`SELECT 1 FROM channels WHERE cursor IS NOT NULL AND selected = 1 LIMIT 1`).toArray().length) {
@@ -654,28 +649,34 @@ export class GuildArchive extends DurableObject<Env> {
     if (current === null || current > next || current < now - 60_000) await this.ctx.storage.setAlarm(next);
   }
 
-  async alarm(): Promise<void> {
-    const conf = this.guildConfig();
-    if (!conf || this.busy || this.get("paused") === "1") return;
-    this.busy = true;
-    try {
-      await this.restWork(conf.guild);
-      await this.memberWork(conf.guild);
-      await this.mediaWork(conf.cfg, conf.guild);
-      const dirtySince = this.get("dirtySince");
-      if (dirtySince) {
-        const now = Date.now();
-        const lastChange = Number(this.get("lastChangeAt") ?? dirtySince);
-        const due = now - lastChange >= conf.cfg.flushIdleMs || now - Number(dirtySince) >= conf.cfg.flushMaxMs;
-        if (due && now >= Number(this.get("retryAt") ?? "0")) await this.flush(conf.guild);
+  alarm(): Promise<void> {
+    return this.lifecycle.work(async () => {
+      const conf = this.guildConfig();
+      if (!conf || this.get("paused") === "1") return;
+      try {
+        // Publish due logs before any optional external work.
+        await this.flushIfDue(conf.cfg, conf.guild);
+        await this.restWork(conf.guild);
+        await this.memberWork(conf.guild);
+        await this.flushIfDue(conf.cfg, conf.guild);
+        await this.dispatchWork(conf.guild);
+        await this.media.work(conf.cfg, conf.guild);
+      } catch (e) {
+        log("alarm_error", { error: errorMessage(e) });
+      } finally {
+        await this.scheduleAlarm();
       }
-      await this.dispatchWork(conf.guild);
-    } catch (e) {
-      // Recorded by the step that failed; swallow so the runtime doesn't retry on top of our own schedule.
-      log("alarm_error", { error: errorMessage(e) });
-    } finally {
-      this.busy = false;
-      await this.scheduleAlarm();
+    });
+  }
+
+  private async flushIfDue(cfg: Config, guild: GuildConfig): Promise<void> {
+    if (this.get("paused") === "1") return;
+    const dirtySince = this.get("dirtySince");
+    if (!dirtySince) return;
+    const now = Date.now();
+    const lastChange = Number(this.get("lastChangeAt") ?? dirtySince);
+    if ((now - lastChange >= cfg.flushIdleMs || now - Number(dirtySince) >= cfg.flushMaxMs) && now >= Number(this.get("retryAt") ?? "0")) {
+      await this.committer.flush(guild);
     }
   }
 
@@ -690,8 +691,12 @@ export class GuildArchive extends DurableObject<Env> {
       pages++;
       let batch: Record<string, any>[];
       try {
-        batch = await discordGet<Record<string, any>[]>(this.env.DISCORD_TOKEN, `/channels/${row.id}/messages?limit=100&after=${row.cursor}`);
+        batch = await discordGet<Record<string, any>[]>(this.env, `/channels/${row.id}/messages?limit=100&after=${row.cursor}`);
       } catch (e) {
+        if (e instanceof DiscordRateLimitError) {
+          this.sql.exec(`UPDATE channels SET rest_next_at = ? WHERE id = ?`, e.retryAt, row.id);
+          continue;
+        }
         if (!isTransient(e)) {
           // No access, wrong channel type, …: final for this channel. Retrying would only add to
           // Discord's invalid-request count.
@@ -715,7 +720,7 @@ export class GuildArchive extends DurableObject<Env> {
       for (const m of batch) {
         const created = snowflakeTime(m.id);
         this.emit(guild, { at: now, src: "rest", t: "MESSAGE_CREATE" }, JSON.stringify(m), created);
-        this.enqueueMedia(mediaInMessage(m, guildId), monthTag(created));
+        this.media.enqueue(mediaInMessage(m, guildId), monthTag(created));
         this.noteMessage(row.id, m.id);
         // REST messages carry no `member` (nickname, roles): snapshot each author's membership once.
         if (m.author?.id && !m.webhook_id) this.sql.exec(`INSERT OR IGNORE INTO members (user_id) VALUES (?)`, m.author.id);
@@ -762,10 +767,10 @@ export class GuildArchive extends DurableObject<Env> {
     for (const { user_id } of rows) {
       let member: Record<string, unknown> | null;
       try {
-        member = pick(await discordGet<Record<string, any>>(this.env.DISCORD_TOKEN, `/guilds/${guildId}/members/${user_id}`), MEMBER_FIELDS);
+        member = pick(await discordGet<Record<string, any>>(this.env, `/guilds/${guildId}/members/${user_id}`), MEMBER_FIELDS);
       } catch (e) {
         if (isTransient(e)) {
-          this.set("memberRetryAt", String(Date.now() + 60_000)); // try again later
+          this.set("memberRetryAt", String(e instanceof DiscordRateLimitError ? e.retryAt : Date.now() + 60_000)); // try again later
           return;
         }
         if (!(e instanceof DiscordError && e.status === 404 && /"code":\s*10007/.test(e.body))) {
@@ -781,217 +786,6 @@ export class GuildArchive extends DurableObject<Env> {
     }
   }
 
-  /** Downloads one pending media item and uploads it as a release asset, paced for GitHub's limits. */
-  private async mediaWork(cfg: Config, guild: GuildConfig): Promise<void> {
-    const now = Date.now();
-    if (now < Number(this.get("githubBackoffUntil") ?? "0")) return;
-    // Default spacing (8 s) keeps uploads under GitHub's 80/min and 500/h content-creation limits.
-    if (now < Number(this.get("lastUploadAt") ?? "0") + cfg.mediaSpacingMs) return;
-    const row = this.sql
-      .exec<MediaRow>(`SELECT key, url, channel_id, message_id, month, attempts FROM media WHERE status = 'pending' AND next_at <= ? ORDER BY next_at LIMIT 1`, now)
-      .toArray()[0];
-    if (!row) return;
-    try {
-      const result = await this.storeMedia(cfg, guild, row);
-      // Attachments carry their channel, so their records are filed (and removable) with it.
-      this.synthetic(guild, result.ok ? "MEDIA_STORED" : "MEDIA_FAILED", { ...result.record, ...(row.channel_id ? { channel_id: row.channel_id } : {}) });
-      this.sql.exec(`UPDATE media SET status = ? WHERE key = ?`, result.ok ? "done" : "failed", row.key);
-    } catch (e) {
-      if (e instanceof GitHubError && (e.retryAfterMs !== null || e instanceof GitHubAuthError)) {
-        // Rate limited, or the App can't access the repo (a setup problem): back off globally
-        // without charging the item an attempt, so fixing the setup loses nothing.
-        const wait = e.retryAfterMs !== null ? Math.max(e.retryAfterMs, 60_000) : 5 * 60_000;
-        this.set("githubBackoffUntil", String(Date.now() + wait));
-        this.set("lastError", JSON.stringify({ at: new Date().toISOString(), error: errorMessage(e).slice(0, 500), status: e.status }));
-        log("github_backoff", { waitMs: wait, error: errorMessage(e) });
-        return;
-      }
-      const attempts = row.attempts + 1;
-      log("media_error", { key: row.key, attempts, error: errorMessage(e) });
-      if (attempts >= MEDIA_MAX_ATTEMPTS) {
-        this.synthetic(guild, "MEDIA_FAILED", { key: row.key, reason: errorMessage(e).slice(0, 200), ...(row.channel_id ? { channel_id: row.channel_id } : {}) });
-        this.sql.exec(`UPDATE media SET status = 'failed', attempts = ? WHERE key = ?`, attempts, row.key);
-      } else {
-        this.sql.exec(`UPDATE media SET attempts = ?, next_at = ? WHERE key = ?`, attempts, Date.now() + 60_000 * 2 ** attempts, row.key);
-      }
-    } finally {
-      this.set("lastUploadAt", String(Date.now()));
-    }
-  }
-
-  private async download(row: MediaRow): Promise<Response | null> {
-    if (!row.url) return null;
-    const res = await fetch(row.url);
-    if (res.ok || !(res.status === 403 || res.status === 404) || !row.message_id || !row.channel_id) return res;
-    // Signed attachment URLs expire; get fresh ones from the message.
-    await res.body?.cancel();
-    const msg = await discordGet<Record<string, any>>(this.env.DISCORD_TOKEN, `/channels/${row.channel_id}/messages/${row.message_id}`).catch(() => null);
-    const fresh = msg && mediaInMessage(msg, this.get("guildId")!).find((r) => r.key === row.key);
-    if (!fresh?.url) return new Response(null, { status: 404 });
-    this.sql.exec(`UPDATE media SET url = ? WHERE key = ?`, fresh.url, row.key);
-    return fetch(fresh.url);
-  }
-
-  private async storeMedia(cfg: Config, guild: GuildConfig, row: MediaRow): Promise<{ ok: boolean; record: Record<string, unknown> }> {
-    const res = await this.download(row);
-    if (!res) return { ok: false, record: { key: row.key, reason: "unsupported" } };
-    if (!res.ok) {
-      await res.body?.cancel();
-      if (res.status === 404 || res.status === 403 || res.status === 410) return { ok: false, record: { key: row.key, reason: `http_${res.status}` } };
-      throw new Error(`download HTTP ${res.status}`);
-    }
-    const type = res.headers.get("content-type") ?? "application/octet-stream";
-    // With Content-Encoding, fetch hands us decoded bytes but Content-Length counts encoded ones.
-    const declared = res.headers.has("content-encoding") ? NaN : Number(res.headers.get("content-length") ?? "NaN");
-    let body: ReadableStream | ArrayBuffer;
-    let length: number;
-    if (Number.isFinite(declared)) {
-      if (declared > cfg.maxMediaBytes) {
-        await res.body?.cancel();
-        return { ok: false, record: { key: row.key, reason: "too_large", size: declared } };
-      }
-      body = res.body!;
-      length = declared;
-    } else {
-      // Unknown length: buffer, but never more than the cap (or 32 MB, to stay well inside memory).
-      const cap = Math.min(cfg.maxMediaBytes, 32 * 1024 * 1024);
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      const reader = res.body!.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.length;
-        if (total > cap) {
-          await reader.cancel();
-          return { ok: false, record: { key: row.key, reason: "too_large" } };
-        }
-        chunks.push(value);
-      }
-      const buf = new Uint8Array(total);
-      let i = 0;
-      for (const c of chunks) {
-        buf.set(c, i);
-        i += c.length;
-      }
-      body = buf.buffer;
-      length = total;
-    }
-
-    const gh = this.gh(guild);
-    const release = await this.release(gh, row.month);
-    let asset = await gh.uploadAsset(release.id, row.key, type, length, body);
-    if (!asset) {
-      // Already uploaded (e.g. the response to an earlier attempt was lost): reuse it.
-      asset = (await gh.listAssets(release.id)).find((a) => a.name === row.key) ?? null;
-      if (!asset) throw new Error("asset exists but could not be found");
-      if (asset.state !== "uploaded") {
-        // A leftover from an interrupted upload: remove it and retry later.
-        await gh.deleteAsset(asset.id);
-        throw new Error("removed incomplete asset from an interrupted upload");
-      }
-    } else {
-      this.set(`releaseCount:${release.tag}`, String(release.count + 1));
-    }
-    return {
-      ok: true,
-      record: { key: row.key, release: release.tag, name: asset.name, url: asset.browser_download_url, size: asset.size, content_type: asset.content_type },
-    };
-  }
-
-  /** The release that assets for `month` go into, rolling over to ".2", ".3", … when full. */
-  private async release(gh: GitHub, month: string): Promise<{ id: number; tag: string; count: number }> {
-    for (let n = 1; ; n++) {
-      const tag = n === 1 ? `media-${month}` : `media-${month}.${n}`;
-      const cachedId = this.get(`releaseId:${tag}`);
-      const cachedCount = this.get(`releaseCount:${tag}`);
-      if (cachedId && cachedCount !== null) {
-        if (Number(cachedCount) < RELEASE_ASSET_LIMIT) return { id: Number(cachedId), tag, count: Number(cachedCount) };
-        continue;
-      }
-      let rel = await gh.releaseByTag(tag);
-      if (!rel) {
-        // Tag the media-root commit explicitly first, so the release never points into archive history.
-        const root = await gh.mediaRoot();
-        await gh.ensureTag(tag, root);
-        rel = await gh.createRelease(tag, root, `Archived Discord media for ${month}. Written by rejgau; see media records in the archive branch's raw logs.`);
-      }
-      const count = (await gh.listAssets(rel.id)).length;
-      this.set(`releaseId:${tag}`, String(rel.id));
-      this.set(`releaseCount:${tag}`, String(count));
-      if (count < RELEASE_ASSET_LIMIT) return { id: rel.id, tag, count };
-    }
-  }
-
-  /** Appends buffered lines to their day files in one commit. */
-  private async flush(guild: GuildConfig): Promise<{ committed: number; sha?: string }> {
-    const rows = this.sql.exec<{ n: number; path: string; line: string }>(`SELECT n, path, line FROM pending ORDER BY n`).toArray();
-    if (!rows.length) {
-      this.set("dirtySince", null);
-      return { committed: 0 };
-    }
-    // Take lines in order until the path or byte budget is used up.
-    const byPath = new Map<string, string[]>();
-    let bytes = 0;
-    let maxN = 0;
-    for (const r of rows) {
-      if (!byPath.has(r.path) && byPath.size >= MAX_FLUSH_PATHS) continue;
-      if (bytes > MAX_FLUSH_BYTES) break;
-      if (!byPath.has(r.path)) byPath.set(r.path, []);
-      byPath.get(r.path)!.push(r.line);
-      bytes += r.line.length;
-      maxN = r.n;
-    }
-    const taken = [...byPath.values()].reduce((n, l) => n + l.length, 0);
-    const gh = this.gh(guild);
-    try {
-      let sha: string | undefined;
-      for (let attempt = 0; attempt < 4 && !sha; attempt++) {
-        // Always build on the current tip: the admin may have rewritten history since last time.
-        const head = await gh.branchHead(guild.branch);
-        const files = [];
-        for (const [path, lines] of byPath) {
-          let existing = head ? await gh.readFile(path, head) : null;
-          if (existing && !existing.endsWith("\n")) existing += "\n";
-          files.push({ path, content: (existing ?? "") + lines.join("\n") + "\n" });
-        }
-        const archiveJson = joinPath(guild.path, "archive.json");
-        const archiveJsonKey = `archiveJson:${guild.repo}:${guild.branch}:${guild.path}`;
-        const writeArchiveJson = !head || (!this.get(archiveJsonKey) && !(await gh.readFile(archiveJson, head)));
-        if (writeArchiveJson) {
-          files.push({ path: archiveJson, content: JSON.stringify({ format: 2, guild_id: this.get("guildId"), generator: "rejgau" }, null, 2) + "\n" });
-        }
-        try {
-          sha = await gh.commit(guild.branch, head, files, `Archive ${taken} event${taken === 1 ? "" : "s"}`);
-        } catch (e) {
-          if (!(e instanceof ConflictError)) throw e;
-          log("flush_conflict", { attempt });
-        }
-      }
-      if (!sha) throw new Error("branch kept moving; will retry");
-      this.set(`archiveJson:${guild.repo}:${guild.branch}:${guild.path}`, "1");
-      const paths = [...byPath.keys()];
-      this.sql.exec(`DELETE FROM pending WHERE n <= ? AND path IN (${paths.map(() => "?").join(",")})`, maxN, ...paths);
-      const remaining = this.sql.exec<{ c: number }>(`SELECT COUNT(*) AS c FROM pending`).one().c;
-      this.set("dirtySince", remaining ? String(Date.now() - 3_600_000) : null); // leftovers: flush again soon
-      this.set("retryAt", null);
-      this.set("failures", null);
-      this.set("lastCommit", JSON.stringify({ sha, at: new Date().toISOString(), lines: taken }));
-      if (guild.pages) this.set("dispatchPending", "1");
-      this.set("lastError", null);
-      log("flush_ok", { sha, lines: taken, files: paths.length });
-      return { committed: taken, sha };
-    } catch (e) {
-      const failures = Number(this.get("failures") ?? "0") + 1;
-      this.set("failures", String(failures));
-      const backoff = e instanceof GitHubError && e.retryAfterMs !== null ? Math.max(e.retryAfterMs, 60_000) : Math.min(15 * 60_000, 30_000 * 2 ** (failures - 1));
-      this.set("retryAt", String(Date.now() + backoff));
-      this.set("lastError", JSON.stringify({ at: new Date().toISOString(), error: errorMessage(e).slice(0, 500), status: e instanceof GitHubError ? e.status : undefined }));
-      log("flush_error", { failures, error: errorMessage(e) });
-      throw e;
-    }
-  }
-
   // --- admin RPC ---
 
   async status(): Promise<GuildStatus> {
@@ -999,6 +793,7 @@ export class GuildArchive extends DurableObject<Env> {
     return {
       paused: this.get("paused") === "1",
       pendingLines: count(`SELECT COUNT(*) AS c FROM pending`),
+      blockedPaths: this.sql.exec<{ path: string; reason: string; retry_at: number }>(`SELECT path, reason, retry_at FROM blocked_paths ORDER BY path LIMIT 40`).toArray(),
       selectedChannels: count(`SELECT COUNT(*) AS c FROM channels WHERE selected = 1 AND deleted = 0`),
       restCursors: count(`SELECT COUNT(*) AS c FROM channels WHERE cursor IS NOT NULL AND selected = 1`),
       mediaPending: count(`SELECT COUNT(*) AS c FROM media WHERE status = 'pending'`),
@@ -1018,27 +813,30 @@ export class GuildArchive extends DurableObject<Env> {
   }
 
   /** Commits everything buffered now (ignoring the flush schedule). */
-  async flushNow(guildId: string): Promise<{ committed?: number; error?: string }> {
-    this.adopt(guildId);
-    const conf = this.guildConfig();
-    if (!conf) return { error: "guild not configured" };
-    if (this.busy) return { error: "busy; try again" };
-    this.busy = true;
-    try {
-      this.set("retryAt", null);
-      let total = 0;
-      for (let i = 0; i < 20; i++) {
-        const r = await this.flush(conf.guild);
-        total += r.committed;
-        if (!r.committed || !this.sql.exec(`SELECT 1 FROM pending LIMIT 1`).toArray().length) break;
+  flushNow(guildId: string): Promise<FlushResult> {
+    const through = this.sql.exec<{ n: number | null }>(`SELECT MAX(n) AS n FROM pending`).one().n ?? 0;
+    return this.lifecycle.work(async () => {
+      this.adopt(guildId);
+      const conf = this.guildConfig();
+      const remaining = () => this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending WHERE n <= ?`, through).one().n;
+      let committed = 0;
+      if (!conf) return { committed, remaining: remaining(), complete: false, error: "guild not configured" };
+      try {
+        this.set("retryAt", null);
+        for (let i = 0; i < 20 && remaining(); i++) {
+          const result = await this.committer.flush(conf.guild, through);
+          committed += result.committed;
+          if (!result.committed) break;
+        }
+        const left = remaining();
+        return { committed, remaining: left, complete: left === 0,
+          ...(left ? { error: "Flush is incomplete. Inspect blockedPaths in status, or repeat the flush to drain the remaining batch." } : {}) };
+      } catch (e) {
+        return { committed, remaining: remaining(), complete: false, error: errorMessage(e) };
+      } finally {
+        await this.scheduleAlarm();
       }
-      return { committed: total };
-    } catch (e) {
-      return { error: errorMessage(e) };
-    } finally {
-      this.busy = false;
-      await this.scheduleAlarm();
-    }
+    });
   }
 
   /**
@@ -1046,29 +844,30 @@ export class GuildArchive extends DurableObject<Env> {
    * event bootstraps and backfills from scratch. For test setups; already-uploaded media is reused.
    */
   reset(): Promise<void> {
-    // On the ingest chain, so no ingest runs before or during the wipe.
-    const run = this.ingestChain.then(async () => {
+    return this.lifecycle.exclusive(async () => {
       await this.ctx.storage.deleteAlarm();
-      await this.ctx.storage.deleteAll();
-      // abort() discards writes not yet confirmed on disk, so wait for the wipe before restarting.
+      this.ctx.storage.transactionSync(() => {
+        for (const table of ["kv", "pending", "channels", "media", "members", "blocked_paths"]) this.sql.exec(`DELETE FROM ${table}`);
+      });
+      this.channels.clear();
+      this.unresolvable.clear();
+      this.github = null;
       await this.ctx.storage.sync();
-      this.ctx.abort("reset", { retryAlarm: false }); // restart with fresh tables
     });
-    this.ingestChain = run.then(() => {}, () => {});
-    return run;
   }
 
   /**
    * Starts archiving without waiting for an event (e.g. right after a reset): records the config,
    * loads the channel tree over REST and queues the backfill.
    */
-  start(guildId: string): Promise<{ started: boolean; error?: string }> {
-    const run = this.ingestChain.then(async () => {
+  start(guildId: string): Promise<{ started: boolean; paused?: boolean; error?: string }> {
+    return this.lifecycle.ingest(async () => {
+      if (this.get("paused") === "1") return { started: false, paused: true };
       this.adopt(guildId);
       const conf = this.guildConfig();
       if (!conf) return { started: false, error: "guild not configured" };
       try {
-        if ((await this.ensurePermissions(guildId, true)) && this.get("initialized")) this.reconcile(conf.guild);
+        if ((await this.ensurePermissions(guildId)) && this.get("initialized")) this.reconcile(conf.guild);
         this.checkConfigChange(conf.guild);
         if (!this.get("initialized") && !(await this.tryBootstrap(conf.guild, guildId))) {
           return { started: false, error: this.get("bootstrapError") ?? "bootstrap failed recently; the next event retries" };
@@ -1080,8 +879,6 @@ export class GuildArchive extends DurableObject<Env> {
         await this.scheduleAlarm();
       }
     });
-    this.ingestChain = run.then(() => {}, () => {});
-    return run;
   }
 
   /** Puts failed media back in the queue (e.g. after fixing the GitHub setup). */
@@ -1095,14 +892,18 @@ export class GuildArchive extends DurableObject<Env> {
 
   /** Stops committing (events keep being buffered), e.g. while the admin rewrites history. */
   async setPaused(paused: boolean): Promise<void> {
-    this.set("paused", paused ? "1" : null);
+    await this.lifecycle.control(() => this.set("paused", paused ? "1" : null));
+    await this.lifecycle.drainWork();
     if (!paused) await this.scheduleAlarm();
   }
 }
 
+export interface FlushResult { committed: number; remaining: number; complete: boolean; error?: string }
+
 export interface GuildStatus {
   paused: boolean;
   pendingLines: number;
+  blockedPaths: { path: string; reason: string; retry_at: number }[];
   selectedChannels: number;
   restCursors: number;
   mediaPending: number;
