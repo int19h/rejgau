@@ -1,14 +1,14 @@
 // Data loading and helpers for the archive reader.
 
 import {
-  parseArchive, parseMonthFile, parseSearchRows, parseUsersFile,
+  MAX_PUBLICATION_FILE_BYTES, parseArchive, parseMonthFile, parseSearchRows, parseUsersFile,
   type Archive, type MonthFile, type Role, type SearchRow, type UserSnap, type UsersFile,
 } from "../../shared/publication";
 import { BoundedCache } from "./cache";
 
 export type { Archive, ChannelInfo, MonthFile, Role, UserSnap, UsersFile } from "../../shared/publication";
 
-export const MAX_JSON_BYTES = 32 * 1024 * 1024;
+export const MAX_JSON_BYTES = MAX_PUBLICATION_FILE_BYTES;
 export const CACHE_BYTES = 16 * 1024 * 1024;
 export const CACHE_ENTRIES = 12;
 const cache = new BoundedCache<unknown>(CACHE_ENTRIES, CACHE_BYTES);
