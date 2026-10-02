@@ -1,12 +1,15 @@
 // Folds an archive's raw log lines into the current state of guild, channels and messages.
 // Pure: no I/O. Used by tools/build.ts to generate the reader's data.
 
+import { sanitize } from "../src/sanitize";
+
 export interface RawLine {
   at: string;
   src: "gw" | "rest" | "rejgau";
   sid?: string;
   s?: number;
   t: string;
+  /** Discord source fields remain open. Generated files use the shared publication contract. */
   d: any;
 }
 
@@ -59,10 +62,12 @@ export interface ArchiveState {
   guild: any;
   channels: Map<string, ChannelState>;
   messages: Map<string, MessageState>;
+  /** Deletions remain known even when no message snapshot exists. */
+  deletedMessages: Map<string, string>;
   /** user id → latest member snapshot from MEMBER_SNAPSHOT (null = left the server). */
   memberSnapshots: Map<string, any | null>;
-  /** People seen only as reactors: user id → { user, member, at } from MESSAGE_REACTION_ADD. */
-  reactors: Map<string, { user: any; member: any; at: string }>;
+  /** Message ID, then user ID, keeps profile sources within their published message. */
+  reactors: Map<string, Map<string, { user: any; member: any; at: string }>>;
   media: Map<string, MediaEntry>;
 }
 
@@ -116,6 +121,7 @@ export function isPublished(state: ArchiveState, id: string): boolean {
 export function referencedMessage(state: ArchiveState, m: any): any | "deleted" | null {
   const id = m.referenced_message?.id ?? (m.type === 19 || m.type === 21 ? m.message_reference?.message_id : undefined);
   if (!id) return null;
+  if (state.deletedMessages.has(id)) return "deleted";
   const known = state.messages.get(id);
   if (known) return known.deletedAt ? "deleted" : known.m;
   return m.type === 21 ? null : (m.referenced_message ?? null);
@@ -127,7 +133,7 @@ export function previewText(content: unknown, max: number): string {
 }
 
 export function emptyState(): ArchiveState {
-  return { guild: {}, channels: new Map(), messages: new Map(), memberSnapshots: new Map(), media: new Map(), reactors: new Map() };
+  return { guild: {}, channels: new Map(), messages: new Map(), deletedMessages: new Map(), memberSnapshots: new Map(), media: new Map(), reactors: new Map() };
 }
 
 function upsertChannel(state: ArchiveState, c: any, selected?: boolean): void {
@@ -162,32 +168,34 @@ function setVotesFrom(ms: MessageState, poll: any): void {
   const counts = poll?.results?.answer_counts;
   if (!Array.isArray(counts)) return;
   const finalized = !!poll.results.is_finalized;
+  const next = new Map<number, Tally>();
   for (const a of counts) {
     const cur = ms.votes.get(a.id) ?? { baseline: 0, known: new Set<string>() };
     if (finalized && tallyCount(cur) !== (a.count ?? 0)) {
       cur.known.clear();
       cur.baseline = a.count ?? 0;
     } else rebase(cur, a.count ?? 0);
-    ms.votes.set(a.id, cur);
+    next.set(a.id, cur);
   }
+  ms.votes = next;
 }
 
 /**
  * Applies a message snapshot (live CREATE/UPDATE or REST). Merges only keys present; a newer
  * `edited_timestamp` records the previous version as an edit; an older one marks a stale copy.
  */
-function upsertMessage(state: ArchiveState, m: any, src: "gw" | "rest"): void {
+function upsertMessage(state: ArchiveState, m: any, src: "gw" | "rest", partial: boolean): void {
   if (!m?.id || !m.channel_id) return;
   const cur = state.messages.get(m.id);
   if (!cur) {
-    const ms: MessageState = { m, channelId: m.channel_id, edits: [], reactions: new Map(), votes: new Map(), pinned: !!m.pinned, src };
+    const ms: MessageState = { m, channelId: m.channel_id, edits: [], reactions: new Map(), votes: new Map(), pinned: !!m.pinned, src, deletedAt: state.deletedMessages.get(m.id) };
     setReactionsFrom(ms, m.reactions);
     setVotesFrom(ms, m.poll);
     state.messages.set(m.id, ms);
     return;
   }
   const prevEdited: string | null = cur.m.edited_timestamp ?? null;
-  const nextEdited: string | null = m.edited_timestamp ?? null;
+  const nextEdited: string | null = partial && m.edited_timestamp === undefined ? prevEdited : m.edited_timestamp ?? null;
   if (prevEdited && (!nextEdited || Date.parse(nextEdited) < Date.parse(prevEdited))) {
     // Stale for content (older copy, e.g. a replay); still take reactions/poll/pin state.
     if (typeof m.pinned === "boolean") cur.pinned = m.pinned;
@@ -214,7 +222,8 @@ function upsertMessage(state: ArchiveState, m: any, src: "gw" | "rest"): void {
 }
 
 export function applyLine(state: ArchiveState, line: RawLine): void {
-  const d = line.d ?? {};
+  // Apply current privacy rules to old raw files without rewriting them.
+  const d = sanitize(line.d ?? {}, line.t);
   switch (line.t) {
     case "GUILD_SNAPSHOT":
     case "GUILD_UPDATE":
@@ -263,7 +272,7 @@ export function applyLine(state: ArchiveState, line: RawLine): void {
 
     case "MESSAGE_CREATE":
     case "MESSAGE_UPDATE":
-      upsertMessage(state, d, line.src === "rest" ? "rest" : "gw");
+      upsertMessage(state, d, line.src === "rest" ? "rest" : "gw", line.src === "gw" && line.t === "MESSAGE_UPDATE");
       // A pin notice (type 6) references the message that got pinned.
       if (d.type === 6 && d.message_reference?.message_id) {
         const pinned = state.messages.get(d.message_reference.message_id);
@@ -271,12 +280,16 @@ export function applyLine(state: ArchiveState, line: RawLine): void {
       }
       return;
     case "MESSAGE_DELETE": {
+      if (typeof d.id !== "string") return;
+      if (!state.deletedMessages.has(d.id)) state.deletedMessages.set(d.id, line.at);
       const ms = state.messages.get(d.id);
       if (ms && !ms.deletedAt) ms.deletedAt = line.at;
       return;
     }
     case "MESSAGE_DELETE_BULK":
       for (const id of d.ids ?? []) {
+        if (typeof id !== "string") continue;
+        if (!state.deletedMessages.has(id)) state.deletedMessages.set(id, line.at);
         const ms = state.messages.get(id);
         if (ms && !ms.deletedAt) ms.deletedAt = line.at;
       }
@@ -291,7 +304,11 @@ export function applyLine(state: ArchiveState, line: RawLine): void {
       const r = ms.reactions.get(key) ?? { emoji: d.emoji, burst, baseline: 0, known: new Set<string>() };
       if (line.t === "MESSAGE_REACTION_ADD") {
         tallyAdd(r, d.user_id);
-        if (d.member?.user?.id) state.reactors.set(d.member.user.id, { user: d.member.user, member: d.member, at: line.at });
+        if (d.member?.user?.id) {
+          let profiles = state.reactors.get(d.message_id);
+          if (!profiles) state.reactors.set(d.message_id, profiles = new Map());
+          profiles.set(d.member.user.id, { user: d.member.user, member: d.member, at: line.at });
+        }
       }
       else tallyRemove(r, d.user_id);
       if (tallyCount(r) === 0) ms.reactions.delete(key);
