@@ -1,7 +1,7 @@
 // Turns folded archive state into the reader's data files. Pure: returns path → JSON value.
 
 import { avatarRef, emojiRef, guildIconRef, mediaInMessage, type MediaRef } from "../src/media";
-import { isPublished, previewText, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, isPublishedMessage, previewText, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { normalizeText } from "../reader/src/text";
 
 /** How a person appeared on one message: the author (or invoker, mentioned user…) as logged then. */
@@ -154,7 +154,8 @@ function messageOut(ms: MessageState, ctx: Context, snaps: SnapTable, media: Set
   else if (ref?.id) {
     out.referenced = {
       id: ref.id,
-      channel_id: ref.channel_id,
+      // Linked only when the original is published (the reader uses channel_id for the link).
+      ...(state.messages.get(ref.id) && isPublishedMessage(state, state.messages.get(ref.id)!) ? { channel_id: ref.channel_id ?? m.channel_id } : {}),
       author: snaps.add(snapUser(ref.author, null)),
       content: previewText(ref.content, 300),
       ...(ref.attachments?.length ? { attachments: true } : {}),
@@ -227,7 +228,7 @@ export function buildSiteData(state: ArchiveState, builtAt = new Date().toISOStr
   const threadCounts = new Map<string, number>();
   for (const ms of state.messages.values()) {
     // Deleted messages (and earlier versions of edited ones) stay in raw/ but aren't published.
-    if (!isPublished(state, ms.channelId) || ms.deletedAt) continue;
+    if (!isPublishedMessage(state, ms)) continue;
     const key = `${ms.channelId}/${monthOf(ms.m.id)}`;
     if (!byFile.has(key)) byFile.set(key, []);
     byFile.get(key)!.push(ms);

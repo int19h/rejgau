@@ -62,3 +62,18 @@ describe("deleted and edited messages", () => {
     expect(all).not.toContain("edited later");
   });
 });
+
+describe("older messages", () => {
+  it("aren't published when only an update to them was archived", () => {
+    const OLD = "1343448063993450516"; // 2025-02
+    const { files } = buildSiteData(
+      fold([
+        line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+        line("MESSAGE_UPDATE", M(OLD, "11", { content: "old" }), 1),
+        line("MESSAGE_CREATE", M(ID1, "11"), 2),
+      ]),
+      "2026-09-30T00:00:00Z",
+    );
+    expect([...files.keys()].filter((k) => k.startsWith("c/"))).toEqual(["c/11/2026-09.json"]);
+  });
+});
