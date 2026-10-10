@@ -275,6 +275,7 @@ To render locally: `npm run build:logs -- --archive ../my-archive --out logs`.
 
 Rendering choices (GitHub strips styles, scripts, video and audio):
 - user text is escaped, to keep it from injecting HTML or Markdown structure;
+- only messages whose creation was archived (live or from history) are shown: Discord also sends updates for older messages, e.g. when it re-processes their attachments or embeds, and those stay in `raw/` only;
 - deleted messages and earlier versions of edited ones aren't shown, here or in the reader; replies to a deleted message say so. They stay in `raw/`, which is public along with the rest of the repo (as are their media in the releases);
 - spoilers fold the whole message into a `<details>` block;
 - custom emoji show as `:name:`, and video, audio and voice messages as links;

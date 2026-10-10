@@ -165,6 +165,22 @@ describe("orphaned threads", () => {
   });
 });
 
+describe("older messages", () => {
+  it("aren't published when only an update to them was archived (e.g. Discord re-processing media)", () => {
+    const OLD = "1343448063993450516"; // 2025-02-24
+    const files = buildLogs(
+      fold([
+        line("CHANNEL_SELECTED", { channel: { id: "11", name: "general", type: 0 } }, 0, "rejgau"),
+        line("MESSAGE_UPDATE", M(OLD, "11", { content: "from before the archive" }), 1),
+        line("MESSAGE_CREATE", M(ID1, "11", { type: 19, content: "a reply", message_reference: { message_id: OLD }, referenced_message: M(OLD, "11", { content: "from before the archive" }) }), 2),
+      ]),
+    );
+    expect([...files.keys()].sort()).toEqual(["README.md", "general/2026/09/29.md", "general/README.md"]);
+    // The reply still quotes it, without a link to a message that isn't in the logs.
+    expect(files.get("general/2026/09/29.md")).toContain("> ↪ replying to **Alice**: from before the archive");
+  });
+});
+
 describe("path collision chains", () => {
   it("keeps every channel and gives each index link a distinct target", () => {
     const inputs: RawLine[] = [];

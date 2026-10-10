@@ -12,7 +12,7 @@
 import { posix } from "node:path";
 import { refForUrl, stickerRef } from "../src/media";
 import { MESSAGE_CHANNEL_TYPES, NORMAL_TYPES, SYSTEM_TEXT, THREAD_TYPES } from "../reader/src/data";
-import { isPublished, previewText, publishedReactorUsers, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
+import { isPublished, isPublishedMessage, previewText, publishedReactorUsers, referencedMessage, tallyCount, type ArchiveState, type MessageState } from "./fold";
 import { customEmoji, escapeHtml, escapeLine, escapeText, inlineCode, link, linkUrl, paragraphs, quote, renderMarkdown, type GfmContext } from "./gfm";
 
 const DISCORD_EPOCH = 1420070400000n;
@@ -95,7 +95,7 @@ function layout(state: ArchiveState): Layout {
   const messages = new Map<string, MessageState[]>();
   for (const ms of state.messages.values()) {
     // Deleted messages (and earlier versions of edited ones) stay in raw/ but aren't published.
-    if (!isPublished(state, ms.channelId) || ms.deletedAt) continue;
+    if (!isPublishedMessage(state, ms)) continue;
     if (!messages.has(ms.channelId)) messages.set(ms.channelId, []);
     messages.get(ms.channelId)!.push(ms);
   }
@@ -146,7 +146,7 @@ function layout(state: ArchiveState): Layout {
     if (first) page.set(id, first);
   }
   const names = new Map<string, string>();
-  const published = [...state.messages.values()].filter((ms) => isPublished(state, ms.channelId) && !ms.deletedAt);
+  const published = [...state.messages.values()].filter((ms) => isPublishedMessage(state, ms));
   for (const ms of published) {
     for (const [id, profile] of publishedReactorUsers(state, ms)) names.set(id, displayName(profile.user, profile.member));
   }
@@ -174,7 +174,8 @@ function messageFile(l: Layout, channelId: string, messageId: string): string | 
 
 /** Where a message is rendered: file path plus anchor, if it's in the logs. */
 function messageHref(env: Env, channelId: string | undefined, messageId: string | undefined): string | null {
-  if (!channelId || !messageId || !env.state.messages.has(messageId) || env.state.messages.get(messageId)!.deletedAt) return null;
+  const target = messageId ? env.state.messages.get(messageId) : undefined;
+  if (!channelId || !messageId || !target || !isPublishedMessage(env.state, target)) return null;
   const file = messageFile(env.layout, channelId, messageId);
   return file ? `${relLink(env.file, file)}#m${messageId}` : null;
 }

@@ -43,6 +43,11 @@ export interface MessageState {
   pinned: boolean;
   /** Where the message came from first: live gateway or REST history. */
   src: "gw" | "rest";
+  /**
+   * Its creation was archived (live or from history). Discord also sends updates for older
+   * messages (e.g. when it re-processes their attachments or embeds); those alone don't count.
+   */
+  created: boolean;
 }
 
 export interface ChannelState {
@@ -117,7 +122,7 @@ export function isPublished(state: ArchiveState, id: string): boolean {
 
 /** Profiles required by current reactions and votes on one published message. */
 export function* publishedReactorUsers(state: ArchiveState, ms: MessageState): Generator<[string, ReactorProfile]> {
-  if (ms.deletedAt || state.deletedMessages.has(ms.m.id) || !isPublished(state, ms.channelId)) return;
+  if (!isPublishedMessage(state, ms)) return;
   const ids = new Set([
     ...[...ms.reactions.values()].flatMap((reaction) => [...reaction.known]),
     ...[...ms.votes.values()].flatMap((vote) => [...vote.known]),
@@ -146,6 +151,14 @@ export function referencedMessage(state: ArchiveState, m: any): any | "deleted" 
 /** A one-line preview of message text (for replies), with spoilers masked as Discord does. */
 export function previewText(content: unknown, max: number): string {
   return String(content ?? "").replace(/\|\|[\s\S]*?\|\|/g, "[spoiler]").replace(/\s+/g, " ").slice(0, max);
+}
+
+/**
+ * Whether a message appears on the site and in the logs: its channel is published, its creation
+ * was archived (not just a later update to an older message), and it wasn't deleted. raw/ keeps all.
+ */
+export function isPublishedMessage(state: ArchiveState, ms: MessageState): boolean {
+  return ms.created && !ms.deletedAt && !state.deletedMessages.has(ms.m.id) && isPublished(state, ms.channelId);
 }
 
 export function emptyState(): ArchiveState {
@@ -200,11 +213,12 @@ function setVotesFrom(ms: MessageState, poll: any): void {
  * Applies a message snapshot (live CREATE/UPDATE or REST). Merges only keys present; a newer
  * `edited_timestamp` records the previous version as an edit; an older one marks a stale copy.
  */
-function upsertMessage(state: ArchiveState, m: any, src: "gw" | "rest", partial: boolean): void {
+function upsertMessage(state: ArchiveState, m: any, src: "gw" | "rest", partial: boolean, create: boolean): void {
   if (!m?.id || !m.channel_id) return;
   const cur = state.messages.get(m.id);
+  if (cur && create) cur.created = true;
   if (!cur) {
-    const ms: MessageState = { m, channelId: m.channel_id, edits: [], reactions: new Map(), votes: new Map(), pinned: !!m.pinned, src, deletedAt: state.deletedMessages.get(m.id) };
+    const ms: MessageState = { m, channelId: m.channel_id, edits: [], reactions: new Map(), votes: new Map(), pinned: !!m.pinned, src, created: create, deletedAt: state.deletedMessages.get(m.id) };
     setReactionsFrom(ms, m.reactions);
     setVotesFrom(ms, m.poll);
     state.messages.set(m.id, ms);
@@ -288,7 +302,7 @@ export function applyLine(state: ArchiveState, line: RawLine): void {
 
     case "MESSAGE_CREATE":
     case "MESSAGE_UPDATE":
-      upsertMessage(state, d, line.src === "rest" ? "rest" : "gw", line.src === "gw" && line.t === "MESSAGE_UPDATE");
+      upsertMessage(state, d, line.src === "rest" ? "rest" : "gw", line.src === "gw" && line.t === "MESSAGE_UPDATE", line.t === "MESSAGE_CREATE");
       // A pin notice (type 6) references the message that got pinned.
       if (d.type === 6 && d.message_reference?.message_id) {
         const pinned = state.messages.get(d.message_reference.message_id);
