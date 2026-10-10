@@ -88,3 +88,54 @@ describe("fold: reactions and polls", () => {
     expect(tallyCount(st.messages.get("100")!.votes.get(1)!)).toBe(3);
   });
 });
+
+describe("fold: publication regressions", () => {
+  it("retains unknown deletion records before a delayed REST snapshot", () => {
+    const single = gw("MESSAGE_DELETE", { id: "100", channel_id: "1" });
+    const bulk = gw("MESSAGE_DELETE_BULK", { ids: ["101", "102"], channel_id: "1" });
+    const st = fold([single, bulk, rest(msg()), rest(msg({ id: "101" })), gw("MESSAGE_DELETE", { id: "100" })]);
+    expect(st.deletedMessages.get("100")).toBe(single.at);
+    expect(st.deletedMessages.get("102")).toBe(bulk.at);
+    expect(st.messages.get("100")?.deletedAt).toBe(single.at);
+    expect(st.messages.get("101")?.deletedAt).toBe(bulk.at);
+  });
+
+  it("merges a partial Gateway update after an edit without accepting a stale complete snapshot", () => {
+    const edited = "2026-09-02T00:00:00Z";
+    const st = fold([
+      gw("MESSAGE_CREATE", msg()),
+      gw("MESSAGE_UPDATE", { id: "100", channel_id: "1", content: "edited", edited_timestamp: edited }),
+      gw("MESSAGE_UPDATE", { id: "100", channel_id: "1", embeds: [{ title: "Fresh unfurl" }], flags: 4, components: [{ type: 10, content: "Complete" }] }),
+      rest({ id: "100", channel_id: "1", content: "stale", embeds: [{ title: "Stale unfurl" }] }),
+      gw("MESSAGE_UPDATE", { id: "100", channel_id: "1", content: "old", edited_timestamp: "2026-09-01T00:00:00Z" }),
+    ]);
+    const ms = st.messages.get("100")!;
+    expect(ms.m).toMatchObject({ content: "edited", edited_timestamp: edited, flags: 4, embeds: [{ title: "Fresh unfurl" }], components: [{ content: "Complete" }] });
+    expect(ms.edits).toHaveLength(1);
+  });
+
+  it.each([false, true])("clears omitted zero-count answers in a results snapshot, finalized=%s", (is_finalized) => {
+    const st = fold([
+      gw("MESSAGE_CREATE", msg({ poll: { answers: [{ answer_id: 1 }, { answer_id: 2 }] } })),
+      gw("MESSAGE_POLL_VOTE_ADD", { message_id: "100", user_id: "7", answer_id: 1 }),
+      gw("MESSAGE_UPDATE", { id: "100", channel_id: "1", poll: { results: { is_finalized, answer_counts: [{ id: 2, count: 1 }] } } }),
+    ]);
+    expect([...st.messages.get("100")!.votes].map(([id, v]) => [id, tallyCount(v)])).toEqual([[2, 1]]);
+  });
+
+  it("preserves unknown poll results but clears an explicitly empty count array", () => {
+    const create = gw("MESSAGE_CREATE", msg({ poll: { results: { answer_counts: [{ id: 1, count: 2 }] } } }));
+    const unknown = gw("MESSAGE_UPDATE", { id: "100", channel_id: "1", poll: { answers: [{ answer_id: 1 }] } });
+    expect(tallyCount(fold([create, unknown]).messages.get("100")!.votes.get(1)!)).toBe(2);
+    const empty = gw("MESSAGE_UPDATE", { id: "100", channel_id: "1", poll: { results: { answer_counts: [] } } });
+    expect(fold([create, unknown, empty]).messages.get("100")!.votes.size).toBe(0);
+  });
+
+  it("applies current member privacy rules to old raw data without changing it", () => {
+    const source = msg({ member: { nick: "Visible", roles: [], flags: 128 }, flags: 4 });
+    const st = fold([gw("MESSAGE_CREATE", source)]);
+    expect(st.messages.get("100")!.m.member).toEqual({ nick: "Visible", roles: [] });
+    expect(st.messages.get("100")!.m.flags).toBe(4);
+    expect(source.member.flags).toBe(128);
+  });
+});

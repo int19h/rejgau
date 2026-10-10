@@ -1,27 +1,31 @@
-// Renders an archive as human-readable GFM logs:
-//   npx tsx tools/buildlogs.ts --archive <archive folder> --out <dir> [--source <text>]
-// Reads <archive>/raw/**/*.jsonl and writes the files described in tools/logs.ts into <dir>.
+// Build readable logs from raw records. A manifest identifies files that the builder owns.
 
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { readRaw } from "./build";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildArgs, provenance, reportSkipped, type BuildOptions } from "./buildargs";
 import { fold } from "./fold";
 import { buildLogs } from "./logs";
+import { publishOutput, writeOutputFile } from "./output";
+import { readRawArchive } from "./raw";
 
-function arg(name: string, optional = false): string | undefined {
-  const i = process.argv.indexOf(`--${name}`);
-  const v = i >= 0 ? process.argv[i + 1] : undefined;
-  if (v === undefined && !optional) throw new Error(`missing --${name}`);
-  return v;
+export async function buildLogArchive(archive: string, out: string, options: BuildOptions = {}): Promise<{ files: number; lines: number }> {
+  const raw = readRawArchive(archive, options);
+  reportSkipped(raw);
+  const metadata = provenance(raw, archive, fileURLToPath(new URL("..", import.meta.url)), options);
+  const source = options.source ?? `archive@${metadata.archive_revision ?? raw.digest}`;
+  const files = buildLogs(fold(raw.lines), { source });
+  files.set("build-info.json", `${JSON.stringify(metadata, null, 2)}\n`);
+  await publishOutput(out, "logs", async (stage) => {
+    for (const [path, text] of files) writeOutputFile(stage, path, text);
+  }, options);
+  return { files: files.size, lines: raw.lines.length };
 }
 
-const archive = arg("archive")!;
-const out = arg("out")!;
-const lines = readRaw(archive);
-const files = buildLogs(fold(lines), { source: arg("source", true) });
-for (const [path, text] of files) {
-  const target = join(out, path);
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, text);
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const main = async () => {
+    const { archive, out, options } = buildArgs();
+    const result = await buildLogArchive(archive, out, options);
+    console.log(`rendered ${result.files} files from ${result.lines} records into ${out}`);
+  };
+  main().catch((error) => { console.error(error); process.exitCode = 1; });
 }
-console.log(`rendered ${files.size} files from ${lines.length} lines into ${out}`);

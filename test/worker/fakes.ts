@@ -22,7 +22,7 @@ export class FakeRepo {
   commits = new Map<string, Commit>();
   refs = new Map<string, string>();
   blobs = new Map<string, string>();
-  releases: { id: number; tag_name: string; assets: { id: number; name: string; size: number; content_type: string; state: string }[] }[] = [];
+  releases: { id: number; tag_name: string; assets: { id: number; name: string; size: number; content_type: string; state: string; browser_download_url: string }[] }[] = [];
   requests: string[] = [];
   /** repository_dispatch event types received. */
   dispatches: string[] = [];
@@ -61,13 +61,15 @@ export class FakeRepo {
     if (url.hostname === "uploads.github.com") {
       const m = /\/releases\/(\d+)\/assets$/.exec(path)!;
       const rel = this.releases.find((r) => r.id === Number(m[1]))!;
+      if (!rel) return json({ message: "Not Found" }, 404);
       const name = url.searchParams.get("name")!;
       if (this.rateLimitUploads > 0) {
         this.rateLimitUploads--;
         return json({ message: "You have exceeded a secondary rate limit." }, 403);
       }
       if (rel.assets.some((a) => a.name === name)) return json({ errors: [{ code: "already_exists" }] }, 422);
-      const asset = { id: newAssetId(), name, size: (body as ArrayBuffer).byteLength, content_type: req.headers.get("content-type")!, state: "uploaded" };
+      if (rel.assets.length >= 1000) return json({ message: "Release asset limit reached" }, 422);
+      const asset = { browser_download_url: `https://github.com/o/r/releases/download/${rel.tag_name}/${name}`, id: newAssetId(), name, size: (body as ArrayBuffer).byteLength, content_type: req.headers.get("content-type")!, state: "uploaded" };
       rel.assets.push(asset);
       return json({ ...asset, browser_download_url: `https://github.com/o/r/releases/download/${rel.tag_name}/${name}` }, 201);
     }

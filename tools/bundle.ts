@@ -1,38 +1,56 @@
-// Bundles the reader (reader/src/main.tsx) into <out>/reader.js + reader.css, and writes index.html
-// referring to them by content hash (?v=…), so browsers never pair a cached old bundle with new data.
+// Bundle the reader and give each script, style sheet, and source map a content hash in its name.
+// The HTML file refers to these exact assets.
 
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { writeOutputFile } from "./output";
 
-const root = new URL("..", import.meta.url).pathname;
+const sourceRoot = new URL("..", import.meta.url);
 
-export async function bundleReader(out: string): Promise<void> {
+/** Each asset name includes a hash of its bytes. The HTML file points to those exact assets. */
+export async function bundleReader(out: string, rootUrl = sourceRoot): Promise<{ fingerprint: string }> {
+  const root = fileURLToPath(rootUrl);
   mkdirSync(out, { recursive: true });
-  await build({
+  const scripts = await build({
     entryPoints: [join(root, "reader/src/main.tsx")],
     bundle: true,
     format: "esm",
     target: "es2022",
     minify: true,
-    sourcemap: true,
+    sourcemap: "linked",
     jsx: "automatic",
     jsxImportSource: "preact",
     outfile: join(out, "reader.js"),
+    write: false,
     logLevel: "warning",
   });
-  await build({
+  const styles = await build({
     entryPoints: [join(root, "reader/src/styles.css")],
     bundle: true,
     minify: true,
     outfile: join(out, "reader.css"),
+    write: false,
     logLevel: "warning",
   });
-  const hash = (file: string) => createHash("sha256").update(readFileSync(join(out, file))).digest("hex").slice(0, 12);
+  const hash = (content: string | Uint8Array) => createHash("sha256").update(content).digest("hex");
+  const map = scripts.outputFiles.find((file) => file.path.endsWith(".js.map"));
+  const script = scripts.outputFiles.find((file) => file.path.endsWith(".js"));
+  const style = styles.outputFiles.find((file) => file.path.endsWith(".css"));
+  if (!map || !script || !style) throw new Error("Reader bundler did not return all expected assets");
+  const mapName = `reader-${hash(map.contents)}.js.map`;
+  const scriptText = script.text.replace(/\/\/# sourceMappingURL=reader\.js\.map\s*$/, `//# sourceMappingURL=${mapName}\n`);
+  const scriptName = `reader-${hash(scriptText)}.js`;
+  const styleName = `reader-${hash(style.contents)}.css`;
+  writeOutputFile(out, mapName, map.contents);
+  writeOutputFile(out, scriptName, scriptText);
+  writeOutputFile(out, styleName, style.contents);
   const html = readFileSync(join(root, "reader/index.html"), "utf8")
-    .replace('href="reader.css"', `href="reader.css?v=${hash("reader.css")}"`)
-    .replace('src="reader.js"', `src="reader.js?v=${hash("reader.js")}"`);
-  if (!html.includes("reader.js?v=") || !html.includes("reader.css?v=")) throw new Error("index.html: reader.js/reader.css references not found");
-  writeFileSync(join(out, "index.html"), html);
+    .replace('href="reader.css"', `href="${styleName}"`)
+    .replace('src="reader.js"', `src="${scriptName}"`);
+  if (!html.includes(scriptName) || !html.includes(styleName)) throw new Error("index.html: reader.js/reader.css references not found");
+  writeOutputFile(out, "index.html", html);
+  return { fingerprint: hash(`${scriptName}\n${styleName}\n${mapName}\n${html}`) };
 }

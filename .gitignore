@@ -2,3 +2,5 @@ node_modules/
 .wrangler/
 .dev.vars
 site/
+test-results/
+playwright-report/

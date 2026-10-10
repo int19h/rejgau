@@ -59,3 +59,29 @@ describe("sanitize", () => {
     expect(publicSessionId("abc")).toMatch(/^[0-9a-f]{16}$/);
   });
 });
+
+describe("sanitize: member context", () => {
+  it.each([
+    { roles: [], flags: 128, nick: "Example" },
+    { roles: [], joined_at: null, flags: 128 },
+    { flags: 128 },
+    null,
+  ])("removes private flags from a partial or nullable member: %j", (member) => {
+    const cleaned = sanitize({ flags: 4, member, attachments: [{ flags: 8 }] });
+    expect(cleaned.member).toEqual(member === null ? null : Object.fromEntries(Object.entries(member).filter(([key]) => key !== "flags")));
+    expect(cleaned.flags).toBe(4);
+    expect(cleaned.attachments).toEqual([{ flags: 8 }]);
+  });
+
+  it("removes flags from root members and thread membership without dropping channel flags", () => {
+    expect(sanitize({ flags: 128 }, "GUILD_MEMBER_UPDATE")).toEqual({});
+    expect(sanitize({ id: "10", flags: 1 }, "THREAD_MEMBER_UPDATE")).toEqual({ id: "10" });
+    expect(sanitize({ flags: 16, member: { flags: 1 }, members: [{ flags: 2 }], added_members: [{ flags: 4, member: { flags: 128 } }] }, "THREAD_UPDATE"))
+      .toEqual({ flags: 16, member: {}, members: [{}], added_members: [{ member: {} }] });
+  });
+
+  it("removes private user flags from partial authors and preserves public flags", () => {
+    expect(sanitize({ author: { id: "7", flags: 16, public_flags: 64 }, mentions: [{ id: "8", flags: 16 }] }))
+      .toEqual({ author: { id: "7", public_flags: 64 }, mentions: [{ id: "8" }] });
+  });
+});

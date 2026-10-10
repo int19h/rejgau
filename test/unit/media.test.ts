@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { emojiRefsInText, mediaInMessage, refForUrl, sanitizeName, stickerRef } from "../../src/media";
 
 describe("refForUrl", () => {
+  it("keeps malformed attachment escapes from aborting media extraction", () => {
+    expect(refForUrl("https://cdn.discordapp.com/attachments/1/2/%FF.png")).toMatchObject({ key: "att-2-FF.png" });
+    expect(refForUrl("https://cdn.discordapp.com/attachments/1/2/my%20pic.png")).toMatchObject({ key: "att-2-my_pic.png" });
+  });
   it("keys attachments by ID and rewrites the blocked media proxy to the CDN", () => {
     const r = refForUrl("https://media.discordapp.net/attachments/1/2/my%20pic.png?ex=a&is=b&hm=c&", { channelId: "1", messageId: "9" });
     expect(r).toEqual({ key: "att-2-my_pic.png", url: "https://cdn.discordapp.com/attachments/1/2/my%20pic.png?ex=a&is=b&hm=c&", channelId: "1", messageId: "9" });

@@ -30,6 +30,7 @@ it("identifies, forwards configured guilds' events through the outbox, and resum
   ];
   const gw = env.GATEWAY.get(env.GATEWAY.idFromName("main"));
   await gw.ensureRunning();
+  await runInDurableObject(gw, (object) => { (object as any).set("connectionWakeAt", "0"); });
   await runDurableObjectAlarm(gw);
 
   await until(() => gateway.identifies.length === 1, "IDENTIFY");
@@ -49,6 +50,7 @@ it("identifies, forwards configured guilds' events through the outbox, and resum
   // (The fake's socket belongs to the GatewaySession's I/O context, so close it from there.)
   await runInDurableObject(gw, () => gateway.server!.close(4000, "test drop"));
   await until(async () => !(await gw.status()).connected, "disconnect noticed");
+  await runInDurableObject(gw, (object) => { (object as any).set("connectionWakeAt", "0"); });
   await runDurableObjectAlarm(gw);
   await until(() => gateway.resumes.length === 1, "RESUME");
   expect(gateway.resumes[0]).toEqual({ token: "discord-token", session_id: "sess-1", seq: 4 });
